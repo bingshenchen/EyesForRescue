@@ -1,5 +1,5 @@
 import requests
-from src.demoForKlant.getadress import getLoc
+from src.main_app.demoForKlant import getLoc
 
 
 def get_weather(latitude, longitude):

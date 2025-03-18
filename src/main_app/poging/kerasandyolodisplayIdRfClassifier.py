@@ -6,7 +6,6 @@ from ultralytics import YOLO
 from collections import deque
 import joblib
 
-# 加载环境变量
 load_dotenv()
 
 class SORT:
@@ -15,16 +14,12 @@ class SORT:
         self.track_id_count = 0
 
     def update(self, detections):
-        """
-        更新跟踪器，根据检测结果分配唯一 ID。
-        """
         updated_tracks = []
         for detection in detections:
             x1, y1, x2, y2 = detection[:4]
             cls = detection[4]
             matched = False
 
-            # 匹配现有跟踪器
             for tracker in self.trackers:
                 if self.iou(tracker['bbox'], detection[:4]) > 0.3:
                     tracker['bbox'] = detection[:4]
@@ -35,7 +30,6 @@ class SORT:
                     matched = True
                     break
 
-            # 如果未匹配，创建新的跟踪器
             if not matched:
                 new_tracker = {
                     'id': self.track_id_count,
@@ -47,16 +41,12 @@ class SORT:
                 self.track_id_count += 1
                 updated_tracks.append(new_tracker)
 
-        # 更新跟踪器列表
         self.trackers = [t for t in updated_tracks if t['misses'] < 3]
 
         return [[*tracker['bbox'], tracker['id'], tracker['cls']] for tracker in self.trackers]
 
     @staticmethod
     def iou(bbox1, bbox2):
-        """
-        计算两个边框的 IOU。
-        """
         x1, y1, x2, y2 = bbox1
         x3, y3, x4, y4 = bbox2
 
@@ -151,9 +141,9 @@ def process_single_video(video_path, tracking_model, pose_model, classifier):
 
         while True:
             key = cv2.waitKey(1) & 0xFF
-            if key == ord(' '):  # 空格键跳到下一帧
+            if key == ord(' '):
                 break
-            elif key == ord('q'):  # 按 'q' 键退出
+            elif key == ord('q'):
                 cap.release()
                 cv2.destroyAllWindows()
                 return

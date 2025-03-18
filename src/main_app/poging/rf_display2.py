@@ -5,13 +5,13 @@ from joblib import load
 import time
 
 # Load the classifier
-classifier_path = "classifier.pkl"
+classifier_path = "../../../assets/classifier/classifier.pkl"
 with open(classifier_path, 'rb') as f:
     classifier = load(f)
 print("Classifier Loaded:", classifier)
 
 # Load the YOLO model
-yolo_model = YOLO("yolo11n-pose.pt")
+yolo_model = YOLO("../../../assets/classifier/yolo11n-pose.pt")
 print("YOLO Model Loaded.")
 
 # Dictionary to store the duration of the "Need Help" state

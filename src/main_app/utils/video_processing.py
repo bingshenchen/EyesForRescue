@@ -3,7 +3,7 @@ import cv2
 from ultralytics import YOLO
 from PIL import Image, ImageTk
 from dotenv import load_dotenv
-from src.utils.calculate_danger import calculate_danger
+from src.main_app.utils.calculate_danger import calculate_danger
 import tkinter as tk
 from threading import Event
 

@@ -1,7 +1,7 @@
 import tkinter as tk
 
 
-def setup_menubar(root, extract_frames, generate_labels, train_model, open_video_file, start_camera, analyze_report, alert_test):
+def setup_menubar(root, extract_frames, generate_labels, train_model, open_video_file, start_camera, analyze_report):
     """Set up the menu bar with options for different functionalities."""
     menubar = tk.Menu(root)
 
@@ -25,7 +25,7 @@ def setup_menubar(root, extract_frames, generate_labels, train_model, open_video
     # Analysis Menu
     analysis_menu = tk.Menu(menubar, tearoff=0)
     analysis_menu.add_command(label="Model Performance Report", command=analyze_report)
-    analysis_menu.add_command(label="Alert Test", command=alert_test)
+    # analysis_menu.add_command(label="Alert Test", command=alert_test)
     menubar.add_cascade(label="Analysis", menu=analysis_menu)
 
     root.config(menu=menubar)

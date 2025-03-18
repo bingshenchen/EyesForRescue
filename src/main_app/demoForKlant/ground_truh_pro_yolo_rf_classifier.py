@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 from asyncio import Queue, Lock
 from concurrent.futures import ThreadPoolExecutor
@@ -13,7 +12,7 @@ from ultralytics import YOLO
 import textwrap
 
 from poging_gen import analyze_image
-from getadress import getLoc, get_address
+from src.main_app.demoForKlant.gps import getLoc, get_address
 
 # Load environment variables
 load_dotenv()

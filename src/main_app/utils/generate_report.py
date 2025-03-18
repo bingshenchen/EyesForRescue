@@ -2,7 +2,7 @@ import os
 import pandas as pd
 import logging
 from dotenv import load_dotenv
-from src.detection.fall_detection import detect_fall_in_video
+from src.main_app.utils.detection.fall_detection import detect_fall_in_video
 
 
 def read_labels(label_dir):

@@ -2,7 +2,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter import ttk
 import pandas as pd
-from src.utils.generate_report import generate_batch_report
+from src.main_app.utils.generate_report import generate_batch_report
 
 
 class AnalyzeReportGUI:

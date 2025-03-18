@@ -2,7 +2,7 @@ import os
 import cv2
 import logging
 from dotenv import load_dotenv
-from src.utils import calculate_danger
+from src.main_app.utils import calculate_danger
 from ultralytics import YOLO
 
 

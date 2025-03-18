@@ -1,6 +1,6 @@
 import threading
 import tkinter as tk
-from src.utils.video_processing import process_video
+from src.main_app.utils.video_processing import process_video
 
 # Global stop event for controlling the camera processing
 stop_event = threading.Event()
