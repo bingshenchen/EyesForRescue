@@ -20,7 +20,7 @@ import pandas as pd
 load_dotenv()
 
 # Define paths
-PROJECT_ROOT = Path(os.getenv('PROJECT_ROOT', '.'))
+PROJECT_ROOT = Path(os.getenv('PROJECT_ROOT', ''))
 OUTPUT_DIR = PROJECT_ROOT / "assets" / "classifier"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 

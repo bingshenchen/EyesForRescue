@@ -4,7 +4,7 @@ import psutil
 import threading
 import tkinter as tk
 
-from src.classifier_test.stuff import process_images
+from src.train.classifier_test.stuff import process_images
 from src.gui.gui_analyze import AnalyzeReportGUI
 from src.gui.gui_extract_frame import update_main_frame_for_extract_frames
 from src.gui.gui_generate_labels import update_main_frame_for_generate_labels
@@ -14,7 +14,7 @@ from src.gui.gui_train_model import update_main_frame_for_train_model
 from src.gui.gui_open_video_file import update_main_frame_for_fall_detection_video
 from src.gui.gui_menubar import setup_menubar
 
-from src.models.train_model import train_yolo_model
+from src.train.models.train_model import train_yolo_model
 from src.utils.extract_frames import save_video_frames
 from src.utils.video_processing import process_video
 from src.utils.generate_labels_g import create_labels_using_yolo

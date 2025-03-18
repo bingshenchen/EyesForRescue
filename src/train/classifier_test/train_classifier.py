@@ -14,7 +14,7 @@ from keras.src.legacy.preprocessing.image import ImageDataGenerator
 load_dotenv()
 
 # Define paths
-PROJECT_ROOT = os.getenv('PROJECT_ROOT', '.')
+PROJECT_ROOT = os.getenv('PROJECT_ROOT', '')
 OUTPUT_DIR = os.getenv('OUTPUT_DIR', './output')
 train_path = os.getenv('TRAINING_CLASSIFIER_PATH', './train')
 test_path = os.getenv('TEST_CLASSIFIER_PATH', './test')
