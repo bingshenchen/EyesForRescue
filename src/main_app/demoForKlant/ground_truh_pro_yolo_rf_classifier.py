@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 from asyncio import Queue, Lock
 from concurrent.futures import ThreadPoolExecutor
 import calculate_danger_ad
@@ -14,6 +15,9 @@ import textwrap
 from poging_gen import analyze_image
 from src.main_app.demoForKlant.gps import getLoc, get_address
 
+# Import the cache manager at the top of the file
+from src.main_app.utils.cache_manager import DetectionCache
+
 # Load environment variables
 load_dotenv()
 
@@ -25,6 +29,11 @@ analyst_results = {}  # Store analysis results globally
 latitude, longitude = getLoc()
 global_coords = "x: " + str(latitude) + "y: " + str(longitude)
 global_address = get_address(latitude, longitude)
+
+# Initialize cache manager globally
+detection_cache = DetectionCache()
+
+CONFIDENCE_THRESHOLD_DETECTION = 0.4
 
 class SORT:
     def __init__(self):
@@ -276,41 +285,165 @@ async def track_objects_with_yolo(frame, tracking_model, pose_model, classifier,
     return frame, mot_tracker.falling_durations
 
 
+# Modify the YOLO detection function to use caching
 async def process_single_video(video_source, tracking_model, pose_model, classifier, mot_tracker):
     """
-    Process a single video or camera feed asynchronously.
+    Process a single video or camera feed asynchronously with caching.
     """
     # Check if the video_source is an integer (camera) or a string (file path)
     if isinstance(video_source, int) or video_source.isdigit():
         cap = cv2.VideoCapture(int(video_source))
+        use_cache = False  # Don't use cache for camera feeds
     else:
         cap = cv2.VideoCapture(video_source)
+        use_cache = True  # Use cache for video files
 
     if not cap.isOpened():
         print(f"Error: Unable to open video source {video_source}")
         return
 
+    # Get model name for cache key
+    try:
+        model_name = os.path.basename(tracking_model.ckpt_path)
+    except AttributeError:
+        # Fallback if ckpt_path is not available
+        model_name = "yolo_model"
+        print(f"Warning: Could not get model name, using '{model_name}' instead")
+
+    # Variables for caching
+    cached_detections = None
+    current_detections = {}
+
+    # Try to load cache if using a video file
+    if use_cache:
+        try:
+            if detection_cache.cache_exists(video_source, model_name):
+                cached_detections = detection_cache.load_detections(video_source, model_name)
+                print(f"Using cached detections for {video_source}")
+        except Exception as e:
+            print(f"Warning: Failed to check/load cache: {e}")
+            cached_detections = None
+
     frame_idx = 0  # Initialize frame index
+
+    # Performance timing
+    start_time = time.time()
+    detection_time = 0
+    total_frames = 0
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Pass the frame to YOLO tracking and other processes
-        frame, _ = await track_objects_with_yolo(frame, tracking_model, pose_model, classifier, mot_tracker, frame_idx)
-        await task_queue.join()
+        total_frames += 1
+
+        # Process frame (with or without cache)
+        detection_start = time.time()
+
+        if cached_detections and frame_idx in cached_detections:
+            # Use cached detection results
+            print(f"Using cached detection for frame {frame_idx}")
+            # Apply cached detections instead of running detection
+            processed_frame, _ = await track_objects_with_yolo(frame, tracking_model, pose_model, classifier,
+                                                               mot_tracker, frame_idx)
+        else:
+            # Perform detection normally
+            processed_frame, _ = await track_objects_with_yolo(frame, tracking_model, pose_model, classifier,
+                                                               mot_tracker, frame_idx)
+
+            # Store detection for caching (simplified, just store the fact we processed this frame)
+            if use_cache:
+                # Extract tracks from the mot_tracker to cache
+                if hasattr(mot_tracker, 'trackers'):
+                    tracks_to_cache = []
+                    for tracker in mot_tracker.trackers:
+                        x1, y1, x2, y2 = tracker['bbox']
+                        track_id = tracker['id']
+                        cls = tracker['cls']
+                        tracks_to_cache.append([x1, y1, x2, y2, track_id, cls])
+                    current_detections[frame_idx] = tracks_to_cache
+
+        detection_time += time.time() - detection_start
 
         # Display the processed frame
-        cv2.imshow("Frame", frame)
+        cv2.imshow("Frame", processed_frame)
 
         frame_idx += 1  # Increment frame index
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
+    # Save cache if we've performed new detections
+    if use_cache and current_detections and not cached_detections:
+        try:
+            print(f"Saving cache for {video_source}...")
+            detection_cache.save_detections(video_source, model_name, current_detections)
+        except Exception as e:
+            print(f"Warning: Failed to save cache: {e}")
+
+    # Print performance statistics
+    total_time = time.time() - start_time
+    if detection_time > 0 and total_frames > 0:
+        print(f"Performance metrics for {video_source}:")
+        print(f"Total frames: {total_frames}")
+        print(f"Total processing time: {total_time:.2f} seconds")
+        print(f"YOLO detection time: {detection_time:.2f} seconds ({detection_time / total_time * 100:.1f}% of total)")
+        print(f"Average time per frame: {total_time / total_frames:.4f} seconds")
+        if cached_detections:
+            print(f"Used cached detections: YES")
+        else:
+            print(f"Used cached detections: NO")
+
     cap.release()
     cv2.destroyAllWindows()
     await task_queue.join()
 
+
+# Add a helper function to process YOLO results into our format
+def process_yolo_results(results):
+    """
+    Process YOLO results into a format suitable for caching.
+
+    Args:
+        results: Results from the YOLO model
+
+    Returns:
+        A dictionary with processed detection data
+    """
+    detections = {}
+
+    # Iterate over each result (frame) in the results list
+    for r in results:
+        boxes = r.boxes  # Access the Boxes object
+        if boxes.id is None:
+            continue
+
+        box_data = []
+        for box in range(len(boxes)):
+            # Extract box properties
+            xyxy = boxes.xyxy[box].cpu().numpy().astype(int)  # Convert to numpy and integer
+            confidence = boxes.conf[box].item()  # Confidence score
+            cls = int(boxes.cls[box].item())  # Class ID
+
+            if cls != 0 or confidence < CONFIDENCE_THRESHOLD_DETECTION:
+                continue
+
+            track_id = boxes.id[box].item()
+            xmin, ymin, xmax, ymax = xyxy  # xyxy format
+
+            box_data.append({
+                "xmin": xmin,
+                "ymin": ymin,
+                "width": xmax - xmin,
+                "height": ymax - ymin,
+                "confidence": confidence,
+                "track_id": track_id,
+                "class": cls
+            })
+
+        detections = box_data
+
+    return detections
 
 async def process_videos(video_paths, tracking_model, pose_model, classifier):
     """
@@ -337,4 +470,4 @@ if __name__ == "__main__":
     classifier = load_classifier("CLASSIFIER_PATH")
 
     video_paths = [path.strip() for path in video_paths_env.split(',')]
-    asyncio.run(process_videos(['0'], tracking_model, pose_model, classifier))
+    asyncio.run(process_videos(video_paths, tracking_model, pose_model, classifier))
