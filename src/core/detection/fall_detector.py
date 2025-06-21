@@ -13,10 +13,10 @@ from ultralytics import YOLO
 import textwrap
 
 from poging_gen import analyze_image
-from src.main_app.demoForKlant.gps import getLoc, get_address
+from src.core.analysis.location_service import getLoc, get_address
 
 # Import the cache manager at the top of the file
-from src.main_app.utils.cache_manager import DetectionCache
+from src.core.utils.cache_manager import DetectionCache
 
 # Load environment variables
 load_dotenv()
