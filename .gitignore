@@ -173,3 +173,18 @@ assets/datasets/
 */**/*data*/
 */**/*processed*/
 /assets/processed_data/runs/
+
+# Output directories (organized)
+outputs/training_runs/
+outputs/processed_videos/
+outputs/cache/
+outputs/temp/
+*.tmp
+# Model files (large)
+*.pt
+*.pth
+*.onnx
+data/models/
+# Cache files
+*.pyc
+.cache/
