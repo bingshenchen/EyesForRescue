@@ -3,10 +3,8 @@
 ## Project Informatie
 **AJ: 2024-2025**   
 **Docent: Jan D'Espallier**  
-**Versie: 1.6**   
-**Laatste update: 08-12-2024**   
-**Groep: Groep13**   
-**Groepsleden: Bingshen Chen, Marthe D'Hooghe, Jorrit Ruelens, Jarne Theys**
+**Versie: 2.0**   
+**Laatste update: 2025-06-21**   
 
 ## Probleemomschrijving
 Wanneer iemand een noodgeval heeft op straat, is de responstijd waarin hulpdiensten kunnen reageren onderhevig aan een aantal stappen waardoor men heen moet om hulp te krijgen. Eerst moet de noodcentrale gebeld worden door voorbijgangers. Die moeten proberen om de belangrijke informatie zo goed mogelijk door te geven, maar doordat het in dit geval meestal gaat over mensen zonder medische achtergrond die vaak ook al onder de indruk zijn van wat er gebeurt is, kan deze stap al gemakkelijk 3 minuten duren. Daarna moeten de hulpdiensten ook nog effectief ter plaatse komen, wat opnieuw een 10 minuten kan duren. En gezien in noodsituaties elke minuut telt, willen wij deze responstijd minimaliseren.    
@@ -92,70 +90,127 @@ Het `main.py` script is het belangrijkste bestand voor het uitvoeren van de trai
 <summary>Hier is een overzicht van de projectstructuur:</summary>
 
 ```plaintext
-AI-Applications/
-    .env
-    .env.example
-    README.md
-    requirements.txt
-    analysis/
-        componentDiagram.png
-        erdDiagram.png
-        flowchart.png
-        sequenceDiagram.png
-        stateDiagram.png
-        userCaseDiagram.png
-    docs/
-        performance report/
-            BestModel1.3/
-                Performance report.md
-                Results/
-                    confusion_matrix_normalized.png
-                    F1_curve.png
-                    labels.jpg
-                    PR_curve.png
-                    P_curve.png
-                    results.png
-                    R_curve.png
-                    train_batch0.jpg
-                    val_batch0_pred.jpg
-        report/
-            WS1.md
-            WS2.md
-            WS3.md
-            WS4.md
-    src/
-        app.py
-        main.py
-        minio-test.py
-        minio_data.py
-        tracked_fall_d.mp4
-        detection/
-            fall_detection.py
-            fall_detection_visualization.py
-        gui/
-            gui_analyze.py
-            gui_extract_frame.py
-            gui_generate_labels.py
-            gui_menubar.py
-            gui_open_video_file.py
-            gui_start_camera.py
-            gui_train_model.py
-        models/
-            best1.2.pt
-            best1.3.pt
-            train_model.py
-            train_model_met_minio.py
-            yolov11n.pt
-        utils/
-            calculate_danger.py
-            evaluate_model_on_video.py
-            extract_frames.py
-            generate_labels_b.py
-            generate_labels_g.py
-            generate_report.py
-            generate_video_raport.py
-            image_detection.py
-            video_processing.py
+📁 AI-Applications/
+├── 📁 config/
+│   ├── 🐍 __init__.py
+│   ├── 🐍 paths.py
+│   ├── 🐍 settings.py
+│   └── 🐍 test_config.py
+├── 📁 data/
+│   └── 📁 models/
+│       ├── 📁 classifier/
+│       │   ├── 💾 classifier.pkl
+│       │   ├── 💾 fine_features.pkl
+│       │   ├── 💾 fine_labels.pkl
+│       │   ├── 💾 needhelp_features.pkl
+│       │   ├── 💾 needhelp_labels.pkl
+│       │   └── 💾 rf_classifier.pkl
+│       └── 📁 yolo/
+│           ├── 🤖 best.pt
+│           ├── 🤖 best1.3.pt
+│           ├── 🤖 best1.4.pt
+│           └── 🤖 yolo11n-pose.pt
+├── 📁 docs/
+│   ├── 📁 analysis/
+│   │   ├── 📎 componentDiagram.png
+│   │   ├── 📎 erdDiagram.png
+│   │   ├── 📎 flowchart.png
+│   │   ├── 📎 sequenceDiagram.png
+│   │   ├── 📎 stateDiagram.png
+│   │   └── 📎 userCaseDiagram.png
+│   ├── 📁 performance report/
+│   │   ├── 📎 Keras.png
+│   │   ├── 📎 performance report.url
+│   │   ├── 📎 Performance.png
+│   │   └── 📎 RF.png
+│   └── 📁 report/
+│       ├── 📝 WS1.md
+│       ├── 📝 WS2.md
+│       ├── 📝 WS3.md
+│       ├── 📝 WS4.md
+│       └── 📝 WS5.md
+├── 📁 outputs/
+│   ├── 📁 evaluation_results/
+│   ├── 📁 processed_videos/
+│   ├── 📁 reports/
+│   ├── 📁 temp/
+│   └── 📁 training_runs/
+│       ├── 📁 detect/
+│       ├── 📁 train/
+│       └── 📁 val/
+├── 📁 src/
+│   ├── 📁 core/
+│   │   ├── 📁 analysis/
+│   │   │   ├── 🐍 __init__.py
+│   │   │   ├── 🐍 danger_calculator.py
+│   │   │   ├── 🐍 gpt_analyzer.py
+│   │   │   ├── 🐍 location_service.py
+│   │   │   └── 🐍 weather_service.py
+│   │   ├── 📁 detection/
+│   │   │   ├── 🐍 __init__.py
+│   │   │   ├── 🐍 fall_detector.py
+│   │   │   ├── 🐍 pose_classifier.py
+│   │   │   └── 🐍 yolo_detector.py
+│   │   ├── 📁 tracking/
+│   │   │   ├── 🐍 __init__.py
+│   │   │   └── 🐍 sort_tracker.py
+│   │   ├── 📁 utils/
+│   │   │   ├── 🐍 __init__.py
+│   │   │   ├── 🐍 cache_manager.py
+│   │   │   ├── 🐍 performance_analyzer.py
+│   │   │   └── 🐍 video_processor.py
+│   │   └── 🐍 __init__.py
+│   ├── 📁 gui/
+│   │   ├── 🐍 __init__.py
+│   │   ├── 🐍 gui_analyze.py
+│   │   ├── 🐍 gui_extract_frame.py
+│   │   ├── 🐍 gui_generate_labels.py
+│   │   ├── 🐍 gui_menubar.py
+│   │   ├── 🐍 gui_minio.py
+│   │   ├── 🐍 gui_open_video_file.py
+│   │   ├── 🐍 gui_run_alert_test.py
+│   │   ├── 🐍 gui_start_camera.py
+│   │   └── 🐍 gui_train_model.py
+│   ├── 📁 train/
+│   │   ├── 📁 classifier/
+│   │   │   ├── 📁 deep_learning/
+│   │   │   │   ├── 🐍 __init__.py
+│   │   │   │   └── 🐍 train_classifier.py
+│   │   │   ├── 📁 random_forest/
+│   │   │   │   ├── 🐍 __init__.py
+│   │   │   │   ├── 🐍 gui_RF.py
+│   │   │   │   ├── 🐍 RF.py
+│   │   │   │   └── 🤖 yolo11n-pose.pt
+│   │   │   └── 🐍 __init__.py
+│   │   ├── 📁 evaluation/
+│   │   │   ├── 🐍 __init__.py
+│   │   │   ├── 🐍 classifier_report.py
+│   │   │   ├── 🐍 fall_detection.py
+│   │   │   └── 🐍 try.py
+│   │   ├── 📁 models/
+│   │   │   ├── 📁 logs/
+│   │   │   ├── 🐍 __init__.py
+│   │   │   ├── 🤖 best1.3.pt
+│   │   │   ├── 🤖 best1.4.pt
+│   │   │   ├── 🐍 train_model.py
+│   │   │   ├── 🐍 train_yolomodel2.py
+│   │   │   └── 🤖 yolo11n-pose.pt
+│   │   └── 🐍 __init__.py
+│   ├── 🐍 __init__.py
+│   └── 🐍 main.py
+├── 📁 test/
+│   └── 📁 Set/
+│       ├── 🐍 check_classifier.py
+│       ├── 🐍 classifier_report.py
+│       ├── 🐍 pr.py
+│       └── 🐍 train_classifier.py
+├── 📁 tests/
+├── 📎 .env.example
+├── 📎 .gitignore
+├── 📎 LICENSE
+├── 🐍 project.py
+├── 📝 README.md
+└── 📄 requirements.txt
 ```
 </details> 
 
