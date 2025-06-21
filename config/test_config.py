@@ -1,3 +1,5 @@
+# config/test_config.py
+
 """
 Test script for the new configuration system.
 Run this to verify that the migration was successful.

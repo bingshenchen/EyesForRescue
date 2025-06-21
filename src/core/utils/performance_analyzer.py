@@ -1,3 +1,5 @@
+# src/core/utils/performance_analyzer.py
+
 import time
 import matplotlib.pyplot as plt
 import pandas as pd

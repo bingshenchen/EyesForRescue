@@ -1,3 +1,5 @@
+# src/gui/gui_open_video_file.py
+
 from tkinter import filedialog, Label, Canvas
 import threading
 

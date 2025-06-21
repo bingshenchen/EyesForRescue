@@ -1,9 +1,11 @@
+# src/core/detection/fall_detector.py
+
 import asyncio
 import os
 import time
 from asyncio import Queue, Lock
 from concurrent.futures import ThreadPoolExecutor
-import calculate_danger_ad
+
 
 import cv2
 import joblib
@@ -12,7 +14,8 @@ from dotenv import load_dotenv
 from ultralytics import YOLO
 import textwrap
 
-from poging_gen import analyze_image
+from src.core.analysis.danger_calculator import calculate_danger
+from src.core.analysis.gpt_analyzer import analyze_image
 from src.core.analysis.location_service import getLoc, get_address
 
 # Import the cache manager at the top of the file
@@ -203,8 +206,7 @@ async def track_objects_with_yolo(frame, tracking_model, pose_model, classifier,
             # Update analysis every 20 frames for "falling_person"
             elif class_name == "falling_person" and mot_tracker.falling_durations[track_id] % 100 == 0:
                 # Calculate danger value
-                danger_value = calculate_danger_ad.calculate_danger(analysis_result,
-                                                                    mot_tracker.falling_durations[track_id])
+                danger_value = calculate_danger(analysis_result,mot_tracker.falling_durations[track_id])
                 danger_values.append(danger_value)
                 print("danger_value: " + str(danger_value))
                 # Add danger value to the top-right corner

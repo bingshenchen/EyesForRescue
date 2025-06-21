@@ -1,3 +1,5 @@
+# src/gui/gui_train_model.py
+
 import tkinter as tk
 from tkinter import filedialog
 

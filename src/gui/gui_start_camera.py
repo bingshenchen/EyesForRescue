@@ -1,3 +1,5 @@
+# src/gui/gui_start_camera.py
+
 import threading
 import tkinter as tk
 from src.core.utils.video_processor import process_video

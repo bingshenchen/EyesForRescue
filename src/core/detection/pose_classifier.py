@@ -1,3 +1,5 @@
+# src/core/detection/pose_classifier.py
+
 import os
 import cv2
 import numpy as np

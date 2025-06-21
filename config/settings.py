@@ -1,3 +1,5 @@
+# config/settings.py
+
 """
 Configuration management for EyesForRescue project.
 Centralizes all environment variable handling and provides validation.

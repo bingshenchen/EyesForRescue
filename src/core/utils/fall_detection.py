@@ -1,4 +1,4 @@
-# src/core/detection/yolo_detector.py
+# src/core/utils/fall_detection.py
 
 import os
 import cv2

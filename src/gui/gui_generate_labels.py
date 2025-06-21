@@ -1,3 +1,5 @@
+# src/gui/gui_generate_labels.py
+
 import tkinter as tk
 from tkinter import filedialog
 

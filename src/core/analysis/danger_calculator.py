@@ -1,7 +1,11 @@
+# src/core/anlaysis/danger_calculator.py
+
 import numpy as np
 from sklearn.naive_bayes import GaussianNB
-from getweer import get_weather
-from poging_gen import analyze_image
+
+from src.core.analysis.gpt_analyzer import analyze_image
+from weather_service import get_weather
+
 
 
 # Initialize Bayesian model

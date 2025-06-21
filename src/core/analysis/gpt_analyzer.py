@@ -1,3 +1,5 @@
+# src/core/anlaysis/gpt_analyzer.py
+
 import base64
 import json
 import os

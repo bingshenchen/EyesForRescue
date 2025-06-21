@@ -1,3 +1,5 @@
+# src/core/utils/cache_manager.py
+
 import os
 import pickle
 import hashlib

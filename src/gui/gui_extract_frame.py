@@ -1,3 +1,5 @@
+# src/gui/gui_extract_frame.py
+
 import tkinter as tk
 from tkinter import filedialog
 
