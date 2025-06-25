@@ -14,7 +14,7 @@ def update_main_frame_for_camera_analysis(main_frame, root):
     for widget in main_frame.winfo_children():
         widget.destroy()
 
-    # Show danger score label
+    # Show danger score labels
     danger_label = tk.Label(main_frame, text="Danger Score: 0", font=("Arial", 20), fg="green")
     danger_label.pack(pady=10)
 

@@ -29,7 +29,7 @@ def make_minio_client():
 
 
 def update_current_path_label():
-    """Update the label to show the current MinIO folder location."""
+    """Update the labels to show the current MinIO folder location."""
     if current_bucket:
         current_path_label.config(text=f"Current Path: {current_bucket}/{current_path}")
     else:
@@ -195,7 +195,7 @@ current_path = ""
 root = Tk()
 root.title("MinIO File Browser")
 
-# Create a label to display the current MinIO folder location
+# Create a labels to display the current MinIO folder location
 current_path_label = Label(root, text="Current Path: /", font=("Helvetica", 10), anchor="w", wraplength=600)
 current_path_label.pack(fill="x", padx=10, pady=5)
 

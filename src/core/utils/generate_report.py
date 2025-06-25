@@ -9,13 +9,13 @@ from src.core.utils.fall_detection import detect_fall_in_video
 
 def read_labels(label_dir):
     """
-    Read all YOLO label files in a directory to count the total occurrences of class 1 (falls).
+    Read all YOLO labels files in a directory to count the total occurrences of class 1 (falls).
 
     Args:
-        label_dir (str): Directory containing label files.
+        label_dir (str): Directory containing labels files.
 
     Returns:
-        int: Total count of labeled falls (class 1) in all label files.
+        int: Total count of labeled falls (class 1) in all labels files.
     """
     truth = 0
 
@@ -31,7 +31,7 @@ def read_labels(label_dir):
                     parts = line.strip().split()
                     if parts and parts[0] == '1':  # Class '1' indicates a fall
                         truth += 1
-            logging.info(f"Processed label file: {file_path}")
+            logging.info(f"Processed labels file: {file_path}")
 
     return truth
 
@@ -95,7 +95,7 @@ def generate_batch_report(video_dir, model_path, classes, frame_skip=5):
                 # Extract detected frames
                 found = [i for i, frame in enumerate(tracking_data) if sum(frame) > 0]
 
-                # Read ground truth count from all label files in the same directory
+                # Read ground truth count from all labels files in the same directory
                 truth = read_labels(root)
 
                 # Calculate metrics

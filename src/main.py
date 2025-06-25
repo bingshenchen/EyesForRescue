@@ -5,18 +5,18 @@ import threading
 import tkinter as tk
 
 # from src.train.evaluation.fall_detection import process_images
-from src.main_app.gui.gui_analyze import AnalyzeReportGUI
-from src.main_app.gui.gui_extract_frame import update_main_frame_for_extract_frames
-from src.main_app.gui.gui_generate_labels import update_main_frame_for_generate_labels
-from src.main_app.gui.gui_start_camera import update_main_frame_for_camera_analysis
-from src.main_app.gui.gui_train_model import update_main_frame_for_train_model
-from src.main_app.gui.gui_open_video_file import update_main_frame_for_fall_detection_video
-from src.main_app.gui.gui_menubar import setup_menubar
+from src.gui.gui_analyze import AnalyzeReportGUI
+from src.gui.gui_extract_frame import update_main_frame_for_extract_frames
+from src.gui.gui_generate_labels import update_main_frame_for_generate_labels
+from src.gui.gui_start_camera import update_main_frame_for_camera_analysis
+from src.gui.gui_train_model import update_main_frame_for_train_model
+from src.gui.gui_open_video_file import update_main_frame_for_fall_detection_video
+from src.gui.gui_menubar import setup_menubar
 
 from src.train.models.train_model import train_yolo_model
-from src.main_app.utils.extract_frames import save_video_frames
+from src.core.utils.extract_frames import save_video_frames
 from src.core.utils.video_processor import process_video
-from src.main_app.utils.generate_labels_g import create_labels_using_yolo
+from src.core.utils.generate_labels_g import create_labels_using_yolo
 
 # Add a global stop_event to be used for stopping video processing
 stop_event = threading.Event()
@@ -64,7 +64,7 @@ def generate_labels():
 
 
 def generate_labels_callback(image_dir, model_path):
-    """Callback function to handle YOLO label generation."""
+    """Callback function to handle YOLO labels generation."""
     kill_all_background_tasks()
     threading.Thread(target=create_labels_using_yolo, args=(image_dir, model_path)).start()
 

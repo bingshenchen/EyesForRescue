@@ -137,7 +137,7 @@ def show_frame_on_canvas(frame, canvas, root):
 
 
 def update_danger_score(score, danger_label):
-    """Update the Danger score label with corresponding color based on the score."""
+    """Update the Danger score labels with corresponding color based on the score."""
     if danger_label.winfo_exists():
         try:
             danger_label.config(text=f"Danger Score: {score}")

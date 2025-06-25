@@ -66,7 +66,7 @@ def predict_images_in_batch(image_arrays, model, threshold=0.8):
 # Evaluate directory in batch
 def evaluate_directory_in_batch(directory, model, true_label):
     """
-    Predict labels for all images in a directory and compare with the true label.
+    Predict labels for all images in a directory and compare with the true labels.
     """
     # Load and preprocess images in batch
     image_arrays, file_paths = preprocess_images_in_batch(directory)
@@ -78,7 +78,7 @@ def evaluate_directory_in_batch(directory, model, true_label):
     # Batch predictions
     predictions = predict_images_in_batch(image_arrays, model)
 
-    # Generate true label list
+    # Generate true labels list
     true_labels = [true_label] * len(predictions)
 
     return predictions, true_labels

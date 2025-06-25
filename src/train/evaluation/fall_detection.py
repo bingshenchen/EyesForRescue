@@ -194,11 +194,11 @@ def extract_features_from_frame_and_return_label(frame):
         features = features.reshape(1, -1)
         numerical_label = clf.predict(features)[0]  # Get the numerical prediction
 
-        # Map numerical label to human-readable label
+        # Map numerical labels to human-readable labels
         label_map = {0: 'fine', 1: 'needshelp'}
         label = label_map.get(numerical_label, 'unknown')  # Default to 'unknown' if mapping fails
 
-        # print(f"Numerical label: {numerical_label}, Decoded label: {label}")
+        # print(f"Numerical labels: {numerical_label}, Decoded labels: {labels}")
         return label
     label = "fine"
     return label

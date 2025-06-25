@@ -42,7 +42,7 @@ needhelp_path = None
 model = YOLO("yolo11n-pose.pt")  # Make sure to use the pose model
 
 # Initialize empty dataframe
-pose_df = pd.DataFrame(columns=["image_path", "label", "features"])
+pose_df = pd.DataFrame(columns=["image_path", "labels", "features"])
 
 
 def extract_features_from_image(image_path, label):

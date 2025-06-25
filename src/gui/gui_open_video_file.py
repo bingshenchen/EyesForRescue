@@ -17,7 +17,7 @@ def update_main_frame_for_fall_detection_video(main_frame, process_video, root):
     video_path = filedialog.askopenfilename()
 
     if video_path:
-        # Show danger score label
+        # Show danger score labels
         danger_label = Label(main_frame, text="Danger Score: 0", font=("Arial", 20), fg="green")
         danger_label.pack(pady=10)
 

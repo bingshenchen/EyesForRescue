@@ -37,7 +37,7 @@ print(f"Need Help folder {needhelp_dir} contains: {len(list(needhelp_dir.glob('*
 model = YOLO("yolo11n-pose.pt")  # Make sure to use the pose model
 
 # Initialize empty dataframe
-pose_df = pd.DataFrame(columns=["image_path", "label", "features"])
+pose_df = pd.DataFrame(columns=["image_path", "labels", "features"])
 
 
 # Feature extraction function using OpenCV for resizing
