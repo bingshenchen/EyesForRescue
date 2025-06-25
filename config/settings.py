@@ -71,7 +71,7 @@ class Settings:
         cache_dir = os.getenv('CACHE_DIR')
         if cache_dir:
             return Path(cache_dir)
-        return self.DATA_DIR / 'cache'
+        return self.OUTPUT_DIR / 'cache'
 
     # ====================================
     # Model Paths
