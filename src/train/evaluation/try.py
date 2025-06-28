@@ -7,8 +7,8 @@ from joblib import load
 from ultralytics import YOLO
 from pathlib import Path
 
-classifier_path = "../../../assets/classifier/classifier.pkl"
-test_dir = r"/assets/datasets/classifier/test"
+classifier_path = "../../../data/models/classifier/classifier.pkl"
+test_dir = "../../../data/datasets/classifier/test"
 fine_dir = os.path.join(test_dir, "fine")
 needhelp_dir = os.path.join(test_dir, "needhelp")
 
@@ -19,7 +19,7 @@ with open(classifier_path, 'rb') as f:
 print("Classifier Loaded:", classifier)
 
 print("Loading YOLO model...")
-yolo_model = YOLO("../../../assets/classifier/yolo11n-pose.pt")
+yolo_model = YOLO("../../../data/models/classifier/yolo11n-pose.pt")
 print("YOLO Model Loaded.")
 
 def extract_features(image_path):

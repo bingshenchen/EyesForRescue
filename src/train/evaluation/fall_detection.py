@@ -1,449 +1,607 @@
 # src/train/evaluation/fall_detection.py
 
-import math
 import os
-from pathlib import Path
-from tkinter import messagebox, filedialog
-import tkinter as tk
 import cv2
 import joblib
 import numpy as np
 import pandas as pd
-from dotenv import load_dotenv
+import tkinter as tk
+from tkinter import messagebox, filedialog, simpledialog
+from pathlib import Path
+import logging
+from typing import List, Optional, Dict, Any
+
 from ultralytics import YOLO
 from tabulate import tabulate
 
+# Import centralized configuration
+from config.settings import get_settings
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize settings
+settings = get_settings()
+
+# Color constants
 RED = (0, 0, 255)
 ORANGE = (0, 165, 255)
 YELLOW = (0, 255, 255)
 GREEN = (0, 255, 0)
 
+# Result indicators
 CORRECT = "✅"
 WRONG = "❌"
 MISSED = "⚠️"
 
+# Global variables
 tracks_history = {}
 fallen_tracker = {}
-
 next_track_id = 0
-load_dotenv()
-CONFIDENCE_THRESHOLD_DETECTION = 0.4
-classifier_location = Path(os.getenv('PROJECT_ROOT')) / "assets" / "classifier" / "classifier.pkl"
-load_dotenv()
-
-model_pose = os.getenv('MODEL_POSE')
-model_base = os.getenv('MODEL_BASE')
-model_file = os.getenv('MODEL_FILE')
-pose_model_file = os.getenv('MODEL_POSE')
-if not model_base or not model_file:
-    raise EnvironmentError("MODEL_BASE and MODEL_FILE environment variables must be set.")
-model_path = os.path.join(model_base, model_file)
-pose_model_path = os.path.join(model_base, pose_model_file)
-
-model = YOLO(model_path)
-pose_model = YOLO(pose_model_path)
-
-GROUND_TRUTHS = [int(x) for x in os.getenv('GROUND_TRUTHS').split(',')]
 detection_results = []
-FRAME_TOLERANCE = 40  # How many frames the prediction can be off to be considered correct
 
-columns = ["frame_idx", "xmin", "ymin", "width", "height", "area", "aspect_ratio", "fall_detected", "bbox_y_center",
-           "alert_triggered"]
-if classifier_location.is_file():
-    print("Loading classifier from file")
-    clf = joblib.load(classifier_location)
-else:
-    print("Classifier file not found")
+# Frame tolerance for evaluation
+FRAME_TOLERANCE = 40
+
+# Detection confidence threshold
+CONFIDENCE_THRESHOLD_DETECTION = settings.CONFIDENCE_THRESHOLD
 
 
-def get_yolo_detections(frame):
-    results = model.track(frame, verbose=False, persist=True, show=False)
+class FallDetectionEvaluator:
+    """Centralized fall detection evaluator with configuration integration."""
 
-    # Uncomment to show the image with bounding boxes
-    # results = model(image, show=True)
-    detections = {}
+    def __init__(self):
+        """Initialize the evaluator with settings."""
+        self.settings = settings
+        self.models = self._load_models()
+        self.reset_tracking_data()
 
-    # Iterate over each result (frame) in the results list
-    for r in results:
-        boxes = r.boxes  # Access the Boxes object
-        for box in range(len(boxes)):
-            if boxes.id is None:
-                continue
-            # Extract box properties
-            xyxy = boxes.xyxy[box].cpu().numpy().astype(int)  # Convert to numpy and integer
-            confidence = boxes.conf[box].item()  # Confidence score
-            cls = int(boxes.cls[box].item())  # Class ID
+    def _load_models(self) -> Dict[str, Any]:
+        """Load required models based on configuration."""
+        models = {}
 
-            if cls != 0:
-                continue
-
-            if confidence < CONFIDENCE_THRESHOLD_DETECTION:
-                continue
-
-            track_id = boxes.id[box].item()
-
-            xmin, ymin, xmax, ymax = xyxy  # xyxy format
-            width = xmax - xmin
-            height = ymax - ymin
-            detections["xmin"] = xmin
-            detections["ymin"] = ymin
-            detections["width"] = width
-            detections["height"] = height
-            detections["confidence"] = confidence
-            detections["track_id"] = track_id
-
-    return detections
-
-
-def has_position_changed(xmin, ymin, width, height, track_id):
-    global tracks_history
-    if track_id not in tracks_history:
-        return True
-
-    last_10_frames = min(10, len(tracks_history[track_id]))
-    last_positions = tracks_history[track_id][-last_10_frames:]
-
-    for i, last_position in last_positions.iterrows():
-        last_xmin = last_position.get("xmin", None)
-        last_ymin = last_position.get("ymin", None)
-        last_width = last_position.get("width", None)
-        last_height = last_position.get("height", None)
-
-        if None in (last_xmin, last_ymin, last_width, last_height):
-            return True
-
-        x_trigger = abs(xmin - last_xmin) > 20
-        y_trigger = abs(ymin - last_ymin) > 20
-        width_trigger = abs(width - last_width) > 20
-        height_trigger = abs(height - last_height) > 20
-
-        if x_trigger or y_trigger or width_trigger or height_trigger:
-            return True
-
-    return False
-
-
-def is_fall_detected(track_id):
-    global tracks_history
-    global fallen_tracker
-
-    if track_id not in tracks_history:
-        raise ValueError(f"Track ID {track_id} not found in tracks history.")
-
-    track_data = tracks_history[track_id]
-    frames_needed = 5  # Number of recent frames to analyze
-
-    if len(track_data) < frames_needed:
-        return False
-
-    tracking_data_last_x_frames = track_data[-frames_needed:]
-
-    aspect_ratios = tracking_data_last_x_frames["aspect_ratio"]
-    areas = tracking_data_last_x_frames["area"]
-    y_positions = tracking_data_last_x_frames["bbox_y_center"]
-
-    avg_area_change = areas.diff().abs().mean()
-    avg_y_position_change = y_positions.diff().mean()
-
-    area_threshold = 2500  # original 100
-    vertical_movement_threshold = 5  # original 10
-
-    area_change_trigger = avg_area_change > area_threshold
-    y_position_trigger = avg_y_position_change > vertical_movement_threshold
-
-    fall_criteria_met = (
-            area_change_trigger
-            and y_position_trigger
-    )
-
-    track_data.loc[tracking_data_last_x_frames.index, "fall_detected"] = fall_criteria_met
-
-    if fall_criteria_met:
-        # Ensure tracker is initialized with "fall_detected"
-        if track_id not in fallen_tracker:
-            fallen_tracker[track_id] = {"static_frames": 0, "fall_detected": True}
+        # Load YOLO detection model
+        if self.settings.YOLO_MODEL_PATH.exists():
+            models['detection'] = YOLO(str(self.settings.YOLO_MODEL_PATH))
+            logger.info(f"Detection model loaded: {self.settings.YOLO_MODEL_PATH}")
         else:
-            fallen_tracker[track_id]["fall_detected"] = True
+            raise FileNotFoundError(f"Detection model not found: {self.settings.YOLO_MODEL_PATH}")
 
-    return fall_criteria_met
+        # Load YOLO pose model
+        if self.settings.POSE_MODEL_PATH.exists():
+            models['pose'] = YOLO(str(self.settings.POSE_MODEL_PATH))
+            logger.info(f"Pose model loaded: {self.settings.POSE_MODEL_PATH}")
+        else:
+            logger.warning(f"Pose model not found: {self.settings.POSE_MODEL_PATH}")
+            models['pose'] = None
 
+        # Load classifier
+        if self.settings.CLASSIFIER_PATH.exists():
+            models['classifier'] = joblib.load(str(self.settings.CLASSIFIER_PATH))
+            logger.info(f"Classifier loaded: {self.settings.CLASSIFIER_PATH}")
+        else:
+            logger.warning(f"Classifier not found: {self.settings.CLASSIFIER_PATH}")
+            models['classifier'] = None
 
-def extract_features_from_frame_and_return_label(frame):
-    """
-    Extract pose keypoints or other features from the given frame using the YOLO pose model.
+        return models
 
-    :param frame: The video frame to extract features from.
-    :return: Extracted features (e.g., keypoints).
-    """
-    # Get pose features using YOLO model
-    results = pose_model(frame, verbose=False)  # Perform pose detection
+    def reset_tracking_data(self):
+        """Reset tracking data for new evaluation."""
+        global tracks_history, fallen_tracker, detection_results
+        tracks_history = {}
+        fallen_tracker = {}
+        detection_results = []
 
-    # Assuming you want to extract the pose keypoints (this depends on the model output)
-    keypoints = results[0].keypoints  # First element in results, and get the keypoints
-
-    # Check if keypoints are present
-    if keypoints is not None:
-        # Extract keypoint coordinates (xy)
-        keypoints_xy = keypoints.xy.cpu().numpy()  # Convert tensor to numpy array
-
-        # Flatten keypoints (x, y) values
-        features = keypoints_xy.flatten()  # Flatten the coordinates into a 1D array
-    else:
-        features = np.zeros(34)  # If no keypoints detected, use a zero vector (adjust size if necessary)
-    if features.size == 34:
-        features = features.reshape(1, -1)
-        numerical_label = clf.predict(features)[0]  # Get the numerical prediction
-
-        # Map numerical labels to human-readable labels
-        label_map = {0: 'fine', 1: 'needshelp'}
-        label = label_map.get(numerical_label, 'unknown')  # Default to 'unknown' if mapping fails
-
-        # print(f"Numerical labels: {numerical_label}, Decoded labels: {labels}")
-        return label
-    label = "fine"
-    return label
-
-
-def process_videos(video_paths, detection_results, seconds_til_alert=5):
-    global tracks_history
-    global fallen_tracker
-
-    for idx, video_path in enumerate(video_paths):
-        has_already_alerted = False
-        video_name = os.path.basename(video_path)
-        print(f"Processing video: {video_name}")
-        cap = cv2.VideoCapture(video_path)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_idx = 0
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            frame_idx += 1
-
-            detections = get_yolo_detections(frame)
-
-            if detections is None:
-                continue
-
-            xmin, ymin, width, height, confidence, track_id = (
-                detections.get("xmin", None),
-                detections.get("ymin", None),
-                detections.get("width", None),
-                detections.get("height", None),
-                detections.get("confidence", None),
-                detections.get("track_id", None),
+    def get_yolo_detections(self, frame: np.ndarray) -> Optional[Dict[str, Any]]:
+        """Get YOLO detections from frame."""
+        try:
+            results = self.models['detection'].track(
+                frame, verbose=False, persist=True, show=False
             )
 
-            if None in (xmin, ymin, width, height, confidence, track_id):
-                continue
+            detections = {}
+            for r in results:
+                boxes = r.boxes
+                if boxes is None or boxes.id is None:
+                    continue
 
-            area = abs(width * height)
-            aspect_ratio = abs(width / height)
-            bbox_y_center = ymin + height / 2
+                for box_idx in range(len(boxes)):
+                    xyxy = boxes.xyxy[box_idx].cpu().numpy().astype(int)
+                    confidence = boxes.conf[box_idx].item()
+                    cls = int(boxes.cls[box_idx].item())
 
-            if track_id not in tracks_history:
-                new_track = pd.DataFrame(
-                    data=[[frame_idx, xmin, ymin, width, height, area, aspect_ratio, False, bbox_y_center, False]],
-                    columns=columns
-                )
-                tracks_history[track_id] = new_track
+                    # Only process person class (class 0)
+                    if cls != 0 or confidence < CONFIDENCE_THRESHOLD_DETECTION:
+                        continue
+
+                    track_id = boxes.id[box_idx].item()
+                    xmin, ymin, xmax, ymax = xyxy
+                    width = xmax - xmin
+                    height = ymax - ymin
+
+                    detections.update({
+                        "xmin": xmin, "ymin": ymin,
+                        "width": width, "height": height,
+                        "confidence": confidence, "track_id": track_id
+                    })
+                    break  # Only process first valid detection
+
+            return detections if detections else None
+
+        except Exception as e:
+            logger.error(f"Detection error: {e}")
+            return None
+
+    def has_position_changed(self, xmin: int, ymin: int, width: int, height: int,
+                             track_id: int, threshold: int = 20) -> bool:
+        """Check if position has changed significantly."""
+        if track_id not in tracks_history:
+            return True
+
+        last_frames = min(10, len(tracks_history[track_id]))
+        if last_frames == 0:
+            return True
+
+        last_positions = tracks_history[track_id][-last_frames:]
+
+        for _, last_position in last_positions.iterrows():
+            last_values = [
+                last_position.get("xmin"), last_position.get("ymin"),
+                last_position.get("width"), last_position.get("height")
+            ]
+
+            if None in last_values:
+                return True
+
+            current_values = [xmin, ymin, width, height]
+            changes = [abs(curr - last) > threshold
+                       for curr, last in zip(current_values, last_values)]
+
+            if any(changes):
+                return True
+
+        return False
+
+    def is_fall_detected(self, track_id: int, area_threshold: float = 2500,
+                         y_threshold: float = 5) -> bool:
+        """Detect fall based on tracking history."""
+        if track_id not in tracks_history:
+            return False
+
+        track_data = tracks_history[track_id]
+        frames_needed = 5
+
+        if len(track_data) < frames_needed:
+            return False
+
+        recent_data = track_data[-frames_needed:]
+        aspect_ratios = recent_data["aspect_ratio"]
+        areas = recent_data["area"]
+        y_positions = recent_data["bbox_y_center"]
+
+        avg_area_change = areas.diff().abs().mean()
+        avg_y_position_change = y_positions.diff().mean()
+
+        area_change_trigger = avg_area_change > area_threshold
+        y_position_trigger = avg_y_position_change > y_threshold
+
+        fall_detected = area_change_trigger and y_position_trigger
+
+        # Update tracking data
+        track_data.loc[recent_data.index, "fall_detected"] = fall_detected
+
+        if fall_detected and track_id not in fallen_tracker:
+            fallen_tracker[track_id] = {"static_frames": 0, "fall_detected": True}
+        elif fall_detected:
+            fallen_tracker[track_id]["fall_detected"] = True
+
+        return fall_detected
+
+    def extract_features_from_frame(self, frame: np.ndarray) -> str:
+        """Extract features and classify using pose model and classifier."""
+        if self.models['pose'] is None or self.models['classifier'] is None:
+            return "fine"
+
+        try:
+            results = self.models['pose'](frame, verbose=False)
+            keypoints = results[0].keypoints
+
+            if keypoints is not None:
+                features = keypoints.xy.cpu().numpy().flatten()
             else:
-                new_track = pd.DataFrame(
-                    data=[[frame_idx, xmin, ymin, width, height, area, aspect_ratio, False, bbox_y_center, False]],
-                    columns=columns
-                )
-                tracks_history[track_id] = pd.concat([tracks_history[track_id], new_track], ignore_index=True)
+                features = np.zeros(34)
 
-            # Detect fall
-            has_fallen = is_fall_detected(track_id)
+            # Ensure correct feature size
+            if features.size == 34:
+                features = features.reshape(1, -1)
+                prediction = self.models['classifier'].predict(features)[0]
+                label_map = {0: 'fine', 1: 'needshelp'}
+                return label_map.get(prediction, 'fine')
 
-            color = GREEN
+        except Exception as e:
+            logger.error(f"Feature extraction error: {e}")
 
-            static_for_seconds = 0
+        return "fine"
 
-            if track_id in fallen_tracker:
-                if not tracks_history[track_id]["alert_triggered"].any():
-                    fallen_tracker[track_id]["fall_detected"] = fallen_tracker[track_id].get("fall_detected",
-                                                                                             False) or has_fallen
+    def process_video(self, video_path: str, video_idx: int,
+                      seconds_til_alert: int = 5) -> bool:
+        """Process a single video for fall detection evaluation."""
+        video_name = Path(video_path).name
+        logger.info(f"Processing video: {video_name}")
 
-                    # Check if person is static
-                    is_static = not has_position_changed(xmin, ymin, width, height, track_id)
-                    if is_static:
-                        fallen_tracker[track_id]["static_frames"] += 1
-                    else:
-                        fallen_tracker[track_id]["static_frames"] = 0
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            logger.error(f"Cannot open video: {video_path}")
+            return False
 
-                    if fallen_tracker[track_id]["fall_detected"]:
-                        color = YELLOW
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_idx = 0
+        has_alerted = False
 
-                    if fallen_tracker[track_id]["fall_detected"] and is_static:
-                        color = ORANGE
-                        static_for_seconds = fallen_tracker[track_id]["static_frames"] / fps
+        # Define columns for tracking data
+        columns = ["frame_idx", "xmin", "ymin", "width", "height", "area",
+                   "aspect_ratio", "fall_detected", "bbox_y_center", "alert_triggered"]
 
-                    static_frames = fallen_tracker[track_id]["static_frames"]
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-                    # Trigger alert regardless of delay between fall and static state
-                    if fallen_tracker[track_id]["fall_detected"] and static_frames >= fps * seconds_til_alert:
-                        label = extract_features_from_frame_and_return_label(frame)
-                        print(f"Label: {label}")
-                        if label == "needshelp":
-                            has_already_alerted = trigger_alert(frame, track_id, seconds_til_alert, frame_idx, idx)
-                            print(f"Alert on frame {frame_idx}")
-                            # Reset state after triggering alert
-                            fallen_tracker[track_id]["fall_detected"] = False
+                frame_idx += 1
+                detections = self.get_yolo_detections(frame)
+
+                if detections is None:
+                    continue
+
+                # Extract detection data
+                xmin, ymin = detections["xmin"], detections["ymin"]
+                width, height = detections["width"], detections["height"]
+                confidence = detections["confidence"]
+                track_id = detections["track_id"]
+
+                # Calculate derived values
+                area = abs(width * height)
+                aspect_ratio = abs(width / height) if height != 0 else 1.0
+                bbox_y_center = ymin + height / 2
+
+                # Update tracking history
+                if track_id not in tracks_history:
+                    tracks_history[track_id] = pd.DataFrame(columns=columns)
+
+                new_data = pd.DataFrame([[
+                    frame_idx, xmin, ymin, width, height, area,
+                    aspect_ratio, False, bbox_y_center, False
+                ]], columns=columns)
+
+                tracks_history[track_id] = pd.concat([
+                    tracks_history[track_id], new_data
+                ], ignore_index=True)
+
+                # Detect fall
+                has_fallen = self.is_fall_detected(track_id)
+                color = GREEN
+                static_for_seconds = 0
+
+                # Process fall detection logic
+                if track_id in fallen_tracker:
+                    if not tracks_history[track_id]["alert_triggered"].any():
+                        fallen_tracker[track_id]["fall_detected"] = (
+                                fallen_tracker[track_id].get("fall_detected", False) or has_fallen
+                        )
+
+                        is_static = not self.has_position_changed(xmin, ymin, width, height, track_id)
+
+                        if is_static:
+                            fallen_tracker[track_id]["static_frames"] += 1
+                        else:
                             fallen_tracker[track_id]["static_frames"] = 0
-                            tracks_history[track_id]["alert_triggered"] = True
 
-                            color = RED
+                        if fallen_tracker[track_id]["fall_detected"]:
+                            color = YELLOW
 
-                else:
-                    color = RED
+                        if fallen_tracker[track_id]["fall_detected"] and is_static:
+                            color = ORANGE
+                            static_for_seconds = fallen_tracker[track_id]["static_frames"] / fps
 
-            # Draw bounding box and information
-            frame = draw_info_on_frame(frame, track_id, xmin, ymin, width, height, color, static_for_seconds)
+                        static_frames = fallen_tracker[track_id]["static_frames"]
 
-            cv2.imshow("Frame", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+                        # Trigger alert
+                        if (fallen_tracker[track_id]["fall_detected"] and
+                                static_frames >= fps * seconds_til_alert):
 
-        cap.release()
+                            label = self.extract_features_from_frame(frame)
+                            if label == "needshelp":
+                                has_alerted = self.trigger_alert(track_id, seconds_til_alert,
+                                                                 frame_idx, video_idx)
+                                if has_alerted:
+                                    fallen_tracker[track_id]["fall_detected"] = False
+                                    fallen_tracker[track_id]["static_frames"] = 0
+                                    tracks_history[track_id]["alert_triggered"] = True
+                                    color = RED
+                    else:
+                        color = RED
 
-        if not has_already_alerted:
-            detection_results[idx]["actual"] = -1
+                # Draw visualization
+                frame = self.draw_info_on_frame(frame, track_id, xmin, ymin,
+                                                width, height, color, static_for_seconds)
 
-    cv2.destroyAllWindows()
+                # Display frame (optional)
+                if self.settings.DEBUG_MODE:
+                    cv2.imshow("Fall Detection Evaluation", frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
 
+        finally:
+            cap.release()
 
-def trigger_alert(frame, track_id, seconds_til_alert, frame_idx, idx) -> bool:
-    label = extract_features_from_frame_and_return_label(frame)
-    if label == "needshelp":
-        print(
-            f"Alert triggered for track ID {track_id}: Person has been static for {seconds_til_alert} seconds after falling."
-        )
-        detection_results[idx]["actual"] = frame_idx
+        if not has_alerted:
+            detection_results[video_idx]["actual"] = -1
+
         return True
-    return False
+
+    def trigger_alert(self, track_id: int, seconds_til_alert: int,
+                      frame_idx: int, video_idx: int) -> bool:
+        """Trigger alert and update results."""
+        logger.info(f"Alert triggered for track {track_id} at frame {frame_idx}")
+        detection_results[video_idx]["actual"] = frame_idx
+        return True
+
+    def draw_info_on_frame(self, frame: np.ndarray, track_id: int,
+                           xmin: int, ymin: int, width: int, height: int,
+                           color: tuple, static_seconds: float) -> np.ndarray:
+        """Draw tracking information on frame."""
+        static_text = f"Static: {static_seconds:.1f}s" if static_seconds > 0 else ""
+
+        # Draw bounding box
+        cv2.rectangle(frame, (xmin, ymin), (xmin + width, ymin + height), color, 2)
+
+        # Draw label
+        label = f"ID: {track_id} {static_text}"
+        cv2.putText(frame, label, (xmin, ymin - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+        return frame
+
+    def show_performance_table(self):
+        """Display performance evaluation table."""
+        df = pd.DataFrame(detection_results)
+
+        # Calculate evaluation metrics
+        df['correct'] = df.apply(
+            lambda row: CORRECT if abs(row['ground_truth'] - row['actual']) <= FRAME_TOLERANCE
+            else "", axis=1
+        )
+        df['wrong'] = df.apply(
+            lambda row: WRONG if (row['actual'] != -1 and
+                                  abs(row['ground_truth'] - row['actual']) > FRAME_TOLERANCE)
+            else "", axis=1
+        )
+        df['missed'] = df.apply(
+            lambda row: MISSED if (row['actual'] == -1 and row['ground_truth'] != -1)
+            else "", axis=1
+        )
+
+        # Reorder columns
+        df = df[['video', 'ground_truth', 'actual', 'correct', 'wrong', 'missed']]
+
+        # Display table
+        print("\n" + "=" * 60)
+        print("FALL DETECTION EVALUATION RESULTS")
+        print("=" * 60)
+        print(tabulate(df, headers='keys', tablefmt='grid'))
+
+        # Calculate summary statistics
+        total_videos = len(df)
+        correct_detections = len(df[df['correct'] == CORRECT])
+        wrong_detections = len(df[df['wrong'] == WRONG])
+        missed_detections = len(df[df['missed'] == MISSED])
+
+        accuracy = correct_detections / total_videos if total_videos > 0 else 0
+        precision = correct_detections / (correct_detections + wrong_detections) if (
+                                                                                                correct_detections + wrong_detections) > 0 else 0
+        recall = correct_detections / (correct_detections + missed_detections) if (
+                                                                                              correct_detections + missed_detections) > 0 else 0
+
+        print(f"\nSUMMARY STATISTICS:")
+        print(f"Total Videos: {total_videos}")
+        print(f"Correct Detections: {correct_detections}")
+        print(f"Wrong Detections: {wrong_detections}")
+        print(f"Missed Detections: {missed_detections}")
+        print(f"Accuracy: {accuracy:.2%}")
+        print(f"Precision: {precision:.2%}")
+        print(f"Recall: {recall:.2%}")
+        print("=" * 60)
+
+        # Save results
+        self.save_evaluation_results(df)
+
+    def save_evaluation_results(self, results_df: pd.DataFrame):
+        """Save evaluation results to file."""
+        try:
+            output_dir = self.settings.EVALUATION_RESULTS_DIR
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            # Save CSV
+            csv_path = output_dir / f"fall_detection_evaluation_{timestamp}.csv"
+            results_df.to_csv(csv_path, index=False)
+
+            # Save detailed report
+            report_path = output_dir / f"fall_detection_report_{timestamp}.txt"
+            with open(report_path, 'w') as f:
+                f.write("Fall Detection Evaluation Report\n")
+                f.write("=" * 50 + "\n\n")
+                f.write(f"Evaluation completed at: {datetime.now()}\n")
+                f.write(f"Configuration used:\n")
+                f.write(f"  Detection Model: {self.settings.YOLO_MODEL_PATH}\n")
+                f.write(f"  Pose Model: {self.settings.POSE_MODEL_PATH}\n")
+                f.write(f"  Classifier: {self.settings.CLASSIFIER_PATH}\n")
+                f.write(f"  Confidence Threshold: {self.settings.CONFIDENCE_THRESHOLD}\n")
+                f.write(f"  Frame Tolerance: {FRAME_TOLERANCE}\n\n")
+                f.write("Results:\n")
+                f.write(tabulate(results_df, headers='keys', tablefmt='grid'))
+
+            logger.info(f"Evaluation results saved to: {csv_path}")
+            logger.info(f"Evaluation report saved to: {report_path}")
+
+        except Exception as e:
+            logger.error(f"Failed to save evaluation results: {e}")
 
 
-def draw_info_on_frame(frame, track_id, xmin, ymin, width, height, color, static_for_seconds):
-    static_seconds_text = f"Static for {static_for_seconds:.2f} seconds" if static_for_seconds > 0 else ""
-    cv2.rectangle(frame, (xmin, ymin), (xmin + width, ymin + height), color, thickness=2)
-    cv2.putText(frame, f"ID: {track_id} {static_seconds_text}", (xmin, ymin - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color,
-                2)
-    return frame
-
-
-def show_performance_table(detection_results):
-    df = pd.DataFrame(detection_results)
-
-    df['correct'] = df.apply(
-        lambda row: CORRECT if abs(row['ground_truth'] - row['actual']) <= FRAME_TOLERANCE else "",
-        axis=1
-    )
-    df['wrong'] = df.apply(
-        lambda row: WRONG if row['actual'] != -1 and abs(row['ground_truth'] - row['actual']) > FRAME_TOLERANCE else "",
-        axis=1
-    )
-    df['missed'] = df.apply(
-        lambda row: MISSED if row['actual'] == -1 and row['ground_truth'] != -1 else "",
-        axis=1
-    )
-
-    # Reorder columns for display
-    df = df[['video', 'ground_truth', 'actual', 'correct', 'wrong', 'missed']]
-
-    # Generate a nicely formatted table
-    print(tabulate(df, headers='keys', tablefmt='grid'))
-
-
-def run_fall_detection(video_paths, ground_truths):
+def run_fall_detection_evaluation(video_paths: List[str], ground_truths: List[int]):
+    """Run fall detection evaluation on multiple videos."""
     global detection_results
 
+    # Initialize evaluator
+    evaluator = FallDetectionEvaluator()
+
     # Initialize detection results
-    detection_results = [{"video": os.path.basename(path), "ground_truth": gt} for path, gt in
-                         zip(video_paths, ground_truths)]
+    detection_results = [
+        {"video": Path(path).name, "ground_truth": gt}
+        for path, gt in zip(video_paths, ground_truths)
+    ]
 
-    # Run processing
-    process_videos(video_paths, detection_results, seconds_til_alert=1)
+    # Process each video
+    for idx, video_path in enumerate(video_paths):
+        evaluator.reset_tracking_data()
+        success = evaluator.process_video(video_path, idx, seconds_til_alert=1)
 
-    # Show the performance table
-    show_performance_table(detection_results)
+        if not success:
+            logger.warning(f"Failed to process video: {video_path}")
+
+    # Show results
+    evaluator.show_performance_table()
 
 
-def gui_main():
-    video_paths = []
-    ground_truths = []
+class FallDetectionGUI:
+    """GUI for fall detection evaluation."""
 
-    def load_videos():
-        nonlocal video_paths
-        files = filedialog.askopenfilenames(filetypes=[("Video files", "*.mp4;*.avi;*.mov")])
+    def __init__(self):
+        self.settings = settings
+        self.video_paths = []
+        self.ground_truths = []
+
+    def create_gui(self):
+        """Create the evaluation GUI."""
+        root = tk.Tk()
+        root.title("Fall Detection Evaluation Tool")
+        root.geometry("600x400")
+
+        # Title
+        title_label = tk.Label(root, text="Fall Detection Evaluation",
+                               font=("Arial", 16, "bold"))
+        title_label.pack(pady=20)
+
+        # Configuration info
+        config_frame = tk.Frame(root, relief=tk.RIDGE, bd=1)
+        config_frame.pack(fill=tk.X, padx=20, pady=10)
+
+        tk.Label(config_frame, text="Configuration:",
+                 font=("Arial", 12, "bold")).pack(anchor=tk.W, padx=10, pady=5)
+
+        config_text = (
+            f"Detection Model: {self.settings.YOLO_MODEL_PATH.name}\n"
+            f"Pose Model: {self.settings.POSE_MODEL_PATH.name}\n"
+            f"Classifier: {self.settings.CLASSIFIER_PATH.name}\n"
+            f"Confidence: {self.settings.CONFIDENCE_THRESHOLD}"
+        )
+
+        tk.Label(config_frame, text=config_text, justify=tk.LEFT,
+                 font=("Arial", 9)).pack(anchor=tk.W, padx=20, pady=5)
+
+        # Buttons
+        button_frame = tk.Frame(root)
+        button_frame.pack(pady=30)
+
+        tk.Button(button_frame, text="Load Videos",
+                  command=self.load_videos, font=("Arial", 12),
+                  bg="#3498db", fg="white", padx=20, pady=10).pack(side=tk.LEFT, padx=10)
+
+        tk.Button(button_frame, text="Set Ground Truths",
+                  command=self.set_ground_truths, font=("Arial", 12),
+                  bg="#f39c12", fg="white", padx=20, pady=10).pack(side=tk.LEFT, padx=10)
+
+        tk.Button(button_frame, text="Start Evaluation",
+                  command=self.start_evaluation, font=("Arial", 12),
+                  bg="#27ae60", fg="white", padx=20, pady=10).pack(side=tk.LEFT, padx=10)
+
+        # Status
+        self.status_label = tk.Label(root, text="Ready",
+                                     font=("Arial", 10), fg="#7f8c8d")
+        self.status_label.pack(pady=20)
+
+        return root
+
+    def load_videos(self):
+        """Load video files for evaluation."""
+        files = filedialog.askopenfilenames(
+            title="Select Video Files",
+            filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv")]
+        )
+
         if files:
-            video_paths = list(files)
-            messagebox.showinfo("Videos Loaded", f"Loaded {len(files)} video(s).")
+            self.video_paths = list(files)
+            self.status_label.config(text=f"Loaded {len(files)} video(s)")
+            messagebox.showinfo("Videos Loaded", f"Loaded {len(files)} video(s)")
 
-    def enter_ground_truths():
-        nonlocal ground_truths
-        if not video_paths:
-            messagebox.showerror("Error", "No videos loaded. Please load videos first.")
+    def set_ground_truths(self):
+        """Set ground truth frames for evaluation."""
+        if not self.video_paths:
+            messagebox.showerror("Error", "Please load videos first")
             return
 
-        ground_truth_input = tk.simpledialog.askstring(
+        ground_truth_input = simpledialog.askstring(
             "Ground Truth Frames",
-            f"Enter ground truth frames for {len(video_paths)} videos, separated by commas:"
+            f"Enter ground truth frames for {len(self.video_paths)} videos\n"
+            "(comma-separated):"
         )
+
         if ground_truth_input:
             try:
-                frames = list(map(int, ground_truth_input.split(',')))
-                if len(frames) != len(video_paths):
-                    raise ValueError("Number of frames does not match number of videos.")
-                ground_truths = frames
-                messagebox.showinfo("Ground Truths Entered", f"Ground truths for {len(frames)} videos saved.")
+                frames = [int(x.strip()) for x in ground_truth_input.split(',')]
+                if len(frames) != len(self.video_paths):
+                    raise ValueError("Number of frames must match number of videos")
+
+                self.ground_truths = frames
+                self.status_label.config(text=f"Ground truths set for {len(frames)} videos")
+                messagebox.showinfo("Success", "Ground truths set successfully")
+
             except ValueError as e:
                 messagebox.showerror("Error", f"Invalid input: {e}")
 
-    def run_detection():
-        if not video_paths or not ground_truths:
-            messagebox.showerror("Error", "Please load videos and ground truths first.")
+    def start_evaluation(self):
+        """Start the evaluation process."""
+        if not self.video_paths or not self.ground_truths:
+            messagebox.showerror("Error", "Please load videos and set ground truths first")
             return
 
         try:
-            run_fall_detection(video_paths, ground_truths)
-            messagebox.showinfo("Processing Complete", "Results have been printed to the terminal.")
+            self.status_label.config(text="Running evaluation...")
+            run_fall_detection_evaluation(self.video_paths, self.ground_truths)
+            self.status_label.config(text="Evaluation completed")
+            messagebox.showinfo("Complete", "Evaluation completed. Check console for results.")
+
         except Exception as e:
-            messagebox.showerror("Error", f"An error occurred during processing: {e}")
+            error_msg = f"Evaluation failed: {e}"
+            logger.error(error_msg)
+            self.status_label.config(text="Evaluation failed")
+            messagebox.showerror("Error", error_msg)
 
-    # Tkinter GUI
-    root = tk.Tk()
-    root.title("Fall Detection Tool")
 
-    # Buttons
-    load_videos_button = tk.Button(root, text="Load Videos", command=load_videos)
-    load_videos_button.pack(pady=10)
+def main():
+    """Main function to run the evaluation."""
+    logger.info("Starting Fall Detection Evaluation")
+    logger.info(f"Using configuration: {settings.PROJECT_ROOT}")
 
-    enter_ground_truths_button = tk.Button(root, text="Enter Ground Truth Frames", command=enter_ground_truths)
-    enter_ground_truths_button.pack(pady=10)
-
-    run_detection_button = tk.Button(root, text="Run Detection", command=run_detection)
-    run_detection_button.pack(pady=10)
-
+    # Create and run GUI
+    gui = FallDetectionGUI()
+    root = gui.create_gui()
     root.mainloop()
 
 
 if __name__ == "__main__":
-    gui_main()
-
-# if __name__ == "__main__":
-#     video_paths = os.getenv("VIDEO_PATHS").split(',')
-#     formatted_video_paths = "\n".join(video_paths)
-#
-#     video_names = [os.path.basename(video_path) for video_path in video_paths]
-#     formatted_video_names = "\n".join(video_names)
-#     print(f"Running fall detection on videos:\n{formatted_video_names}")
-#
-#     for idx, video_name in enumerate(video_names):
-#         detection_results.append({"video": video_name, "ground_truth": GROUND_TRUTHS[idx]})
-#
-#     process_videos(video_paths, seconds_til_alert=1)
-#     show_performance_table()
+    main()

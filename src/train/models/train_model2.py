@@ -1,4 +1,4 @@
-# src/train/models/train_yolomodel2.py
+# src/train/models/train_model2.py
 
 import os
 import logging
