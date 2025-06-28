@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import os
 import time
 import textwrap
 from asyncio import Queue, Lock
@@ -18,6 +17,7 @@ from config.settings import get_settings
 from src.core.analysis.danger_calculator import calculate_danger
 from src.core.analysis.gpt_analyzer import analyze_image
 from src.core.analysis.location_service import getLoc, get_address
+from src.core.detection.optimized_fall_detector import OptimizedFallDetector
 from src.core.utils.cache_manager import DetectionCache
 
 # Configure logging
@@ -243,18 +243,33 @@ async def process_task_queue():
     """
     while True:
         try:
-            track_id, frame = await task_queue.get()
-            logger.debug(f"Processing task for track ID: {track_id}")
+            # Use timeout to prevent hanging
+            try:
+                track_id, frame = await asyncio.wait_for(task_queue.get(), timeout=1.0)
+                logger.debug(f"Processing task for track ID: {track_id}")
 
-            result = await analyze_image_async(track_id, frame)
+                result = await analyze_image_async(track_id, frame)
 
-            async with results_lock:
-                analyst_results[track_id] = result
+                async with results_lock:
+                    analyst_results[track_id] = result
 
+                task_queue.task_done()
+
+            except asyncio.TimeoutError:
+                # No task available, continue waiting
+                continue
+
+        except asyncio.CancelledError:
+            # Task was cancelled, exit gracefully
+            logger.info("Task queue processing cancelled")
+            break
         except Exception as e:
             logger.error(f"Error in task queue processing: {e}")
-        finally:
-            task_queue.task_done()
+            try:
+                task_queue.task_done()
+            except ValueError:
+                # task_done called too many times, ignore
+                pass
 
 
 async def track_objects_with_yolo(frame, tracking_model, pose_model, classifier, mot_tracker, frame_idx):
@@ -428,7 +443,7 @@ def display_analysis_results(frame, analysis_result, start_x, start_y):
 
 async def process_single_video(video_source, tracking_model, pose_model, classifier, mot_tracker):
     """
-    Process a single video or camera feed asynchronously with caching support.
+    Process a single video or camera feed asynchronously with optimized classifier integration.
 
     Args:
         video_source: Video file path or camera index
@@ -437,6 +452,11 @@ async def process_single_video(video_source, tracking_model, pose_model, classif
         classifier: Pose classifier
         mot_tracker: SORT tracker instance
     """
+    # Initialize optimized fall detector
+    optimized_detector = OptimizedFallDetector(settings)
+    optimized_detector.classifier = classifier
+    optimized_detector.pose_model = pose_model
+
     # Determine if source is camera or video file
     if isinstance(video_source, int) or str(video_source).isdigit():
         cap = cv2.VideoCapture(int(video_source))
@@ -474,6 +494,10 @@ async def process_single_video(video_source, tracking_model, pose_model, classif
     detection_time = 0
     total_frames = 0
 
+    # Simple tracking for demo - use consistent track IDs
+    track_id_mapping = {}  # Map detection index to consistent track ID
+    next_track_id = 0
+
     try:
         while cap.isOpened():
             ret, frame = cap.read()
@@ -483,34 +507,75 @@ async def process_single_video(video_source, tracking_model, pose_model, classif
             total_frames += 1
             detection_start = time.time()
 
-            # Process frame
-            if cached_detections and frame_idx in cached_detections:
-                logger.debug(f"Using cached detection for frame {frame_idx}")
-                # Note: In a real implementation, you'd apply cached detections
-                processed_frame, _ = await track_objects_with_yolo(
-                    frame, tracking_model, pose_model, classifier, mot_tracker, frame_idx
-                )
-            else:
-                processed_frame, _ = await track_objects_with_yolo(
-                    frame, tracking_model, pose_model, classifier, mot_tracker, frame_idx
-                )
+            # Get YOLO detections
+            try:
+                results = tracking_model(frame, imgsz=320, verbose=False)
+                if results[0].boxes is not None:
+                    boxes = results[0].boxes.xyxy.cpu().numpy()
+                    confidences = results[0].boxes.conf.cpu().numpy()
+                    classes = results[0].boxes.cls.cpu().numpy()
+                else:
+                    boxes = np.array([])
+                    confidences = np.array([])
+                    classes = np.array([])
+            except Exception as e:
+                logger.error(f"YOLO detection error: {e}")
+                boxes = np.array([])
+                confidences = np.array([])
+                classes = np.array([])
 
-                # Store detection for caching
-                if use_cache and hasattr(mot_tracker, 'trackers'):
-                    tracks_to_cache = []
-                    for tracker in mot_tracker.trackers:
-                        x1, y1, x2, y2 = tracker['bbox']
-                        track_id = tracker['id']
-                        cls = tracker['cls']
-                        tracks_to_cache.append([x1, y1, x2, y2, track_id, cls])
-                    current_detections[frame_idx] = tracks_to_cache
+            # Prepare detections for optimized processor
+            detections = []
+            for i, (box, confidence, cls) in enumerate(zip(boxes, confidences, classes)):
+                if confidence > CONFIDENCE_THRESHOLD_DETECTION:
+                    x1, y1, x2, y2 = map(int, box)
+
+                    # Ensure valid bounding box
+                    if x2 > x1 and y2 > y1:
+                        class_name = tracking_model.names.get(int(cls), 'unknown') if hasattr(tracking_model,
+                                                                                              'names') else 'unknown'
+
+                        # Use consistent track ID mapping
+                        detection_key = f"{x1}_{y1}_{x2}_{y2}"  # Simple spatial mapping
+                        if detection_key not in track_id_mapping:
+                            track_id_mapping[detection_key] = next_track_id
+                            next_track_id += 1
+
+                        track_id = track_id_mapping[detection_key]
+
+                        detections.append({
+                            'bbox': (x1, y1, x2, y2),
+                            'confidence': float(confidence),
+                            'class_name': class_name,
+                            'track_id': track_id
+                        })
+
+            # Use optimized fall detection
+            try:
+                fall_results = optimized_detector.smart_fall_detection(frame, detections, frame_idx)
+
+                # Add bbox information to results for drawing
+                for i, result in enumerate(fall_results):
+                    if i < len(detections):
+                        result['bbox'] = detections[i]['bbox']
+
+            except Exception as e:
+                logger.error(f"Optimized fall detection error: {e}")
+                fall_results = []
+
+            # Draw results on frame
+            try:
+                frame = draw_optimized_results(frame, fall_results)
+            except Exception as e:
+                logger.error(f"Drawing results error: {e}")
 
             detection_time += time.time() - detection_start
 
             # Display frame
-            cv2.imshow("Fall Detection", processed_frame)
+            cv2.imshow("Optimized Fall Detection", frame)
 
             frame_idx += 1
+
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 logger.info("Processing stopped by user")
                 break
@@ -520,30 +585,112 @@ async def process_single_video(video_source, tracking_model, pose_model, classif
     finally:
         cap.release()
         cv2.destroyAllWindows()
-
-    # Save cache if new detections were made
-    if use_cache and current_detections and not cached_detections:
-        try:
-            detection_cache.save_detections(video_source, model_name, current_detections)
-        except Exception as e:
-            logger.warning(f"Failed to save cache: {e}")
+        optimized_detector.cleanup()
 
     # Print performance statistics
     total_time = time.time() - start_time
     if total_frames > 0:
-        logger.info(f"Performance metrics:")
+        logger.info(f"Optimized Performance metrics:")
         logger.info(f"  Total frames: {total_frames}")
         logger.info(f"  Total time: {total_time:.2f}s")
         logger.info(f"  Average FPS: {total_frames / total_time:.2f}")
         logger.info(f"  Detection time: {detection_time:.2f}s ({detection_time / total_time * 100:.1f}%)")
-        logger.info(f"  Cache used: {'Yes' if cached_detections else 'No'}")
 
-    await task_queue.join()
+        # Get optimized detector stats
+        try:
+            stats = optimized_detector.get_performance_stats()
+            logger.info(f"  Classifier queue size: {stats['classification_queue_size']}")
+            logger.info(f"  Cached classifications: {stats['cached_classifications']}")
+        except Exception as e:
+            logger.error(f"Error getting performance stats: {e}")
+
+
+def draw_optimized_results(frame, fall_results):
+    """
+    Draw optimized fall detection results on frame.
+
+    Args:
+        frame: Video frame to draw on
+        fall_results: Results from OptimizedFallDetector
+
+    Returns:
+        Modified frame with drawn results
+    """
+    # Limit the number of information displays to prevent clutter
+    max_displays = 3
+    active_tracks = []
+
+    for result in fall_results:
+        track_id = result['track_id']
+        class_name = result['class_name']
+        is_falling = result['is_falling']
+        classification = result['classification']
+        danger_level = result['danger_level']
+        needs_help = result['needs_help']
+
+        # Choose color based on danger level
+        if needs_help:
+            color = (0, 0, 255)  # Red for high danger
+        elif is_falling:
+            color = (0, 165, 255)  # Orange for falling
+        elif danger_level > 0.3:
+            color = (0, 255, 255)  # Yellow for medium danger
+        else:
+            color = (0, 255, 0)  # Green for safe
+
+        # Draw bounding box if bbox information is available
+        if 'bbox' in result:
+            x1, y1, x2, y2 = result['bbox']
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+            # Draw label above bounding box
+            label = f"ID:{track_id} {class_name}"
+            cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+        # Only show detailed info for active/important tracks
+        if len(active_tracks) < max_displays and (needs_help or is_falling or danger_level > 0.1):
+            active_tracks.append(result)
+
+    # Draw information text on left side only for active tracks
+    for idx, result in enumerate(active_tracks):
+        track_id = result['track_id']
+        class_name = result['class_name']
+        classification = result['classification']
+        danger_level = result['danger_level']
+        needs_help = result['needs_help']
+
+        # Choose color based on danger level
+        if needs_help:
+            color = (0, 0, 255)
+        elif result['is_falling']:
+            color = (0, 165, 255)
+        elif danger_level > 0.3:
+            color = (0, 255, 255)
+        else:
+            color = (0, 255, 0)
+
+        y_offset = 30 + idx * 80  # Use index instead of track_id to prevent jumping
+
+        cv2.putText(frame, f"ID: {track_id}", (10, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        cv2.putText(frame, f"Class: {class_name}", (10, y_offset + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        cv2.putText(frame, f"Classification: {classification}", (10, y_offset + 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        cv2.putText(frame, f"Danger: {danger_level:.2f}", (10, y_offset + 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+    # Show global alerts
+    if any(result['needs_help'] for result in fall_results):
+        cv2.putText(frame, "NEEDS HELP!", (frame.shape[1] - 200, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+
+    return frame
 
 
 async def process_videos(video_paths, tracking_model=None, pose_model=None, classifier=None):
     """
-    Process multiple videos asynchronously.
+    Process multiple videos asynchronously with optimized fall detection.
 
     Args:
         video_paths: List of video file paths
@@ -559,7 +706,7 @@ async def process_videos(video_paths, tracking_model=None, pose_model=None, clas
     if classifier is None:
         classifier = load_classifier()
 
-    # Initialize tracker
+    # Initialize tracker (kept for compatibility)
     tracker_settings = settings.TRACKING_SETTINGS
     mot_tracker = SORT(
         max_miss=tracker_settings['max_miss'],
@@ -568,14 +715,22 @@ async def process_videos(video_paths, tracking_model=None, pose_model=None, clas
     )
 
     # Start task queue processor
-    asyncio.create_task(process_task_queue())
+    task_processor = asyncio.create_task(process_task_queue())
 
-    # Process videos
-    tasks = [
-        process_single_video(video_path, tracking_model, pose_model, classifier, mot_tracker)
-        for video_path in video_paths
-    ]
-    await asyncio.gather(*tasks)
+    try:
+        # Process videos with optimized detector
+        tasks = [
+            process_single_video(video_path, tracking_model, pose_model, classifier, mot_tracker)
+            for video_path in video_paths
+        ]
+        await asyncio.gather(*tasks)
+    finally:
+        # Clean up task processor
+        task_processor.cancel()
+        try:
+            await task_processor
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":
