@@ -18,6 +18,7 @@ from src.core.analysis.danger_calculator import calculate_danger
 from src.core.analysis.gpt_analyzer import analyze_image
 from src.core.analysis.location_service import getLoc, get_address
 from src.core.detection.optimized_fall_detector import OptimizedFallDetector
+from src.core.tracking.sort_tracker import SORT
 from src.core.utils.cache_manager import DetectionCache
 
 # Configure logging
@@ -50,124 +51,6 @@ except Exception as e:
 
 # Detection settings
 CONFIDENCE_THRESHOLD_DETECTION = settings.CONFIDENCE_THRESHOLD
-
-
-class SORT:
-    """
-    Simple Online and Realtime Tracking (SORT) implementation.
-    """
-
-    def __init__(self, max_miss=5, min_hits=3, iou_threshold=0.3):
-        """
-        Initialize SORT tracker.
-
-        Args:
-            max_miss: Maximum number of consecutive misses before track deletion
-            min_hits: Minimum number of hits before track is confirmed
-            iou_threshold: Minimum IoU for track association
-        """
-        self.trackers = []
-        self.track_id_count = 0
-        self.falling_counts = {}
-        self.max_miss = max_miss
-        self.min_hits = min_hits
-        self.iou_threshold = iou_threshold
-
-        logger.debug(f"SORT tracker initialized with max_miss={max_miss}, min_hits={min_hits}")
-
-    def update(self, detections):
-        """
-        Update trackers and assign unique IDs based on detection results.
-
-        Args:
-            detections: List of detections [x1, y1, x2, y2, class_id]
-
-        Returns:
-            List of tracks [x1, y1, x2, y2, track_id, class_id]
-        """
-        updated_tracks = []
-
-        for detection in detections:
-            x1, y1, x2, y2 = detection[:4]
-            cls = detection[4] if len(detection) > 4 else 0
-            matched = False
-
-            # Match with existing trackers
-            for tracker in self.trackers:
-                iou_score = self.iou(tracker['bbox'], detection[:4])
-                if iou_score > self.iou_threshold:
-                    # Update tracker with smoothed bbox using simple averaging
-                    tracker['bbox'] = [
-                        (tracker['bbox'][i] * 0.8 + detection[i] * 0.2)
-                        for i in range(4)
-                    ]
-                    tracker['hits'] += 1
-                    tracker['misses'] = 0
-                    tracker['cls'] = cls
-                    updated_tracks.append(tracker)
-                    matched = True
-                    break
-
-            # Create new tracker if not matched
-            if not matched:
-                new_tracker = {
-                    'id': self.track_id_count,
-                    'bbox': detection[:4],
-                    'hits': 1,
-                    'misses': 0,
-                    'cls': cls
-                }
-                self.track_id_count += 1
-                updated_tracks.append(new_tracker)
-                logger.debug(f"Created new track ID: {new_tracker['id']}")
-
-        # Update misses for unmatched trackers
-        for tracker in self.trackers:
-            if tracker not in updated_tracks:
-                tracker['misses'] += 1
-                if tracker['misses'] < self.max_miss:
-                    updated_tracks.append(tracker)
-
-        # Remove inactive trackers
-        removed_tracks = [t for t in self.trackers if t['misses'] >= self.max_miss]
-        for track in removed_tracks:
-            logger.debug(f"Removed track ID: {track['id']} (too many misses)")
-
-        self.trackers = [t for t in updated_tracks if t['misses'] < self.max_miss]
-
-        # Return tracks that meet minimum hits requirement
-        return [[*tracker['bbox'], tracker['id'], tracker['cls']]
-                for tracker in self.trackers if tracker['hits'] >= self.min_hits]
-
-    @staticmethod
-    def iou(bbox1, bbox2):
-        """
-        Calculate Intersection over Union (IoU) between two bounding boxes.
-
-        Args:
-            bbox1: [x1, y1, x2, y2]
-            bbox2: [x1, y1, x2, y2]
-
-        Returns:
-            IoU value between 0 and 1
-        """
-        x1, y1, x2, y2 = bbox1
-        x3, y3, x4, y4 = bbox2
-
-        # Calculate intersection
-        xi1 = max(x1, x3)
-        yi1 = max(y1, y3)
-        xi2 = min(x2, x4)
-        yi2 = min(y2, y4)
-
-        inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
-
-        # Calculate union
-        box1_area = (x2 - x1) * (y2 - y1)
-        box2_area = (x4 - x3) * (y4 - y3)
-        union_area = box1_area + box2_area - inter_area
-
-        return inter_area / union_area if union_area > 0 else 0
 
 
 def load_yolo_model(model_path=None):
@@ -706,7 +589,7 @@ async def process_videos(video_paths, tracking_model=None, pose_model=None, clas
     if classifier is None:
         classifier = load_classifier()
 
-    # Initialize tracker (kept for compatibility)
+    # Initialize tracker using centralized SORT implementation
     tracker_settings = settings.TRACKING_SETTINGS
     mot_tracker = SORT(
         max_miss=tracker_settings['max_miss'],
