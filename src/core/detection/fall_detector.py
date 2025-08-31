@@ -94,21 +94,49 @@ def load_classifier(classifier_path=None):
     return joblib.load(str(classifier_path))
 
 
-async def analyze_image_async(track_id, frame):
+async def analyze_image_async(track_id, frame, bbox=None):
     """
-    Asynchronously execute analyze_image and store the result.
+    Asynchronously execute analyze_image with proper bounding box extraction.
 
     Args:
         track_id: Unique track identifier
         frame: Video frame to analyze
+        bbox: Person bounding box (x1, y1, x2, y2) - NEW PARAMETER
 
     Returns:
         Analysis result dictionary
     """
     try:
         logger.debug(f"Starting analysis for track ID {track_id}")
+
+        # CRITICAL FIX: Extract person crop if bbox provided
+        if bbox is not None:
+            x1, y1, x2, y2 = bbox
+            # Ensure valid coordinates
+            height, width = frame.shape[:2]
+            x1 = max(0, min(x1, width))
+            y1 = max(0, min(y1, height))
+            x2 = max(x1 + 1, min(x2, width))
+            y2 = max(y1 + 1, min(y2, height))
+
+            # Extract person crop
+            person_crop = frame[y1:y2, x1:x2]
+
+            # Validate crop size
+            if person_crop.size > 0:
+                analysis_frame = person_crop
+                logger.debug(f"Using person crop: {person_crop.shape} for track {track_id}")
+            else:
+                logger.warning(f"Invalid person crop for track {track_id}, using full frame")
+                analysis_frame = frame
+        else:
+            # Fallback to full frame if no bbox
+            analysis_frame = frame
+            logger.debug(f"No bbox provided for track {track_id}, using full frame")
+
+        # Execute analysis on the appropriate frame/crop
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(executor, analyze_image, frame)
+        result = await loop.run_in_executor(executor, analyze_image, analysis_frame)
         logger.debug(f"Analysis completed for track ID {track_id}")
 
         async with results_lock:

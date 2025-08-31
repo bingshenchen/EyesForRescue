@@ -432,3 +432,90 @@ def get_video_info(video_path):
     except Exception as e:
         print(f"Error getting video info: {e}")
         return None
+
+
+def analyze_person_state(class_name, bbox, frame, duration):
+    """
+    Enhanced person state analysis with context awareness.
+    """
+    # Basic classification from YOLO
+    is_non_standing = class_name in ["falling_person", "sitting_person", "lying_person"]
+
+    if not is_non_standing:
+        return "normal", 0.0
+
+    # Context-aware analysis
+    danger_score = 0.0
+
+    # 1. Duration analysis
+    if class_name == "falling_person":
+        if duration > 50:  # Sustained falling state
+            danger_score += 0.6
+        else:
+            danger_score += 0.3
+
+    # 2. Environment context
+    if class_name == "lying_person":
+        # Check if on furniture (low danger) vs ground (higher danger)
+        if is_on_furniture(bbox, frame):
+            danger_score += 0.1  # Lying on chair/bed
+        else:
+            danger_score += 0.4  # Lying on ground
+
+    # 3. Movement analysis
+    if duration > 100 and class_name != "person":  # Long time in non-standing position
+        danger_score += 0.3
+
+    return class_name, min(danger_score, 1.0)
+
+
+def is_on_furniture(bbox, frame):
+    """
+    Simple heuristic to detect if person is on furniture.
+    """
+    x1, y1, x2, y2 = bbox
+    person_bottom = y2
+    frame_height = frame.shape[0]
+
+    # If person's bottom is not near ground level, likely on furniture
+    ground_ratio = person_bottom / frame_height
+    return ground_ratio < 0.8  # Person not near bottom of frame
+
+
+def draw_enhanced_information_overlay(frame, frame_num, detections, fall_duration, history):
+    """
+    Enhanced information display with better classification breakdown.
+    """
+    # Count different types of detections
+    detection_counts = {
+        'person': 0,
+        'sitting_person': 0,
+        'lying_person': 0,
+        'falling_person': 0
+    }
+
+    for detection in detections:
+        class_name = detection.get('class_name', 'unknown')
+        if class_name in detection_counts:
+            detection_counts[class_name] += 1
+
+    # Calculate danger-specific detection rate
+    danger_detections = sum(history[-30:]) if len(history) >= 30 else sum(history)
+    total_recent_frames = min(30, len(history))
+
+    info_texts = [
+        f"Frame: {frame_num}",
+        f"People: {detection_counts['person']}",
+        f"Sitting: {detection_counts['sitting_person']}",
+        f"Lying: {detection_counts['lying_person']}",
+        f"Falling: {detection_counts['falling_person']}",
+        f"Danger Rate: {danger_detections}/{total_recent_frames}",
+        f"Fall Duration: {fall_duration}"
+    ]
+
+    # Draw with better formatting
+    y_start = 30
+    for i, text in enumerate(info_texts):
+        color = (0, 0, 255) if 'Falling' in text or 'Danger' in text else (255, 255, 255)
+        cv2.putText(frame, text, (10, y_start + i * 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)

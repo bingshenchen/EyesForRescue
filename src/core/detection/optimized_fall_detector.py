@@ -9,6 +9,8 @@ import numpy as np
 import logging
 
 logger = logging.getLogger(__name__)
+STANDARD_INPUT_SIZE = (224, 224)  # Consistent with classifier training
+YOLO_INPUT_SIZE = 224  # Must be multiple of 32 for YOLO
 
 
 class OptimizedFallDetector:
@@ -28,11 +30,19 @@ class OptimizedFallDetector:
         self.confidence_threshold = 0.7
         self.batch_size = 4
 
+        # IMPROVED: Better queue management
+        self.max_queue_size = 50
+        self.queue_cleanup_threshold = 25
+
         # Caching and queuing systems
         self.classification_cache = {}
-        self.pose_queue = Queue(maxsize=100)
+        self.pose_queue = Queue(maxsize=self.max_queue_size)
         self.classification_thread = None
         self.thread_running = False
+
+        # Performance monitoring
+        self.dropped_tasks = 0
+        self.processed_tasks = 0
 
         # Tracking history for each detected person
         self.track_histories = {}
@@ -47,8 +57,7 @@ class OptimizedFallDetector:
 
     def start_classification_thread(self):
         """
-        Start background classification thread to avoid blocking main detection pipeline.
-        Creates a separate thread that processes pose classification requests in batches.
+        Start background classification thread with improved queue management.
         """
 
         def classification_worker():
@@ -57,20 +66,24 @@ class OptimizedFallDetector:
 
             while self.thread_running:
                 try:
+                    # IMPROVED: Handle queue overflow
+                    self._manage_queue_overflow()
+
                     # Collect batch processing data with timeout
                     try:
                         item = self.pose_queue.get(timeout=0.1)
-                        if item is None:
+                        if item is None:  # Shutdown signal
                             break
 
                         track_id, pose_features = item
+                        self.processed_tasks += 1
 
                         # Validate pose features
                         if pose_features is not None and len(pose_features) > 0:
                             batch_poses.append(pose_features)
                             batch_track_ids.append(track_id)
 
-                        # Process when batch is full
+                        # Process when batch is full or timeout
                         if len(batch_poses) >= self.batch_size:
                             self.process_classification_batch(batch_poses, batch_track_ids)
                             batch_poses.clear()
@@ -91,9 +104,120 @@ class OptimizedFallDetector:
                     batch_track_ids.clear()
                     continue
 
+            # Process any remaining items before shutdown
+            if batch_poses:
+                self.process_classification_batch(batch_poses, batch_track_ids)
+
         self.thread_running = True
         self.classification_thread = threading.Thread(target=classification_worker, daemon=True)
         self.classification_thread.start()
+        logger.info("Classification thread started with queue management")
+
+    def _manage_queue_overflow(self):
+        """
+        ADDED: Prevent memory leaks by managing queue size.
+        """
+        queue_size = self.pose_queue.qsize()
+
+        if queue_size > self.max_queue_size * 0.8:  # 80% capacity warning
+            logger.warning(f"Classification queue approaching capacity: {queue_size}/{self.max_queue_size}")
+
+        if queue_size >= self.max_queue_size:
+            # Drop oldest tasks to prevent memory overflow
+            dropped_count = 0
+            try:
+                while self.pose_queue.qsize() > self.queue_cleanup_threshold:
+                    self.pose_queue.get_nowait()
+                    dropped_count += 1
+                    self.dropped_tasks += 1
+
+                logger.warning(f"Dropped {dropped_count} old classification tasks to prevent overflow")
+            except Empty:
+                pass
+
+    def smart_fall_detection(self, frame, detections, frame_idx):
+        """
+        IMPROVED: Smart fall detection with better queue management.
+        """
+        results = []
+
+        try:
+            for detection in detections:
+                track_id = detection.get('track_id', 0)
+                class_name = detection.get('class_name', 'person')
+
+                # Initialize tracking history for new tracks
+                if track_id not in self.track_histories:
+                    self.track_histories[track_id] = {
+                        'fall_frames': deque(maxlen=30),
+                        'last_classification_frame': -1,
+                        'stable_classification': None,
+                        'confidence_score': 0.0
+                    }
+
+                history = self.track_histories[track_id]
+                is_falling = (class_name == "falling_person")
+                history['fall_frames'].append(is_falling)
+
+                # Smart classifier triggering
+                try:
+                    should_classify = self.should_trigger_classification(
+                        track_id, frame_idx, is_falling, history
+                    )
+
+                    if should_classify:
+                        # Extract pose features and add to queue with overflow protection
+                        pose_features = self.extract_pose_features_fast(frame, detection)
+                        if pose_features is not None:
+                            # IMPROVED: Non-blocking queue add with overflow handling
+                            try:
+                                self.pose_queue.put_nowait((track_id, pose_features))
+                                history['last_classification_frame'] = frame_idx
+                                logger.debug(f"Added classification task for track {track_id}")
+                            except:
+                                # Queue full, manage overflow
+                                self._manage_queue_overflow()
+                                try:
+                                    self.pose_queue.put_nowait((track_id, pose_features))
+                                    history['last_classification_frame'] = frame_idx
+                                except:
+                                    logger.debug(f"Queue still full, skipping classification for track {track_id}")
+                                    self.dropped_tasks += 1
+
+                    # Get latest classification result
+                    classification_result = self.get_latest_classification(track_id)
+
+                    # Calculate danger level
+                    danger_level = self.calculate_danger_level(
+                        track_id, is_falling, classification_result, history
+                    )
+
+                    results.append({
+                        'track_id': track_id,
+                        'class_name': class_name,
+                        'is_falling': is_falling,
+                        'classification': classification_result,
+                        'danger_level': danger_level,
+                        'needs_help': danger_level > 0.7
+                    })
+
+                except Exception as e:
+                    logger.error(f"Error processing detection for track {track_id}: {e}")
+                    # Add basic result even if processing failed
+                    results.append({
+                        'track_id': track_id,
+                        'class_name': class_name,
+                        'is_falling': is_falling,
+                        'classification': 'unknown',
+                        'danger_level': 0.5,
+                        'needs_help': False
+                    })
+
+        except Exception as e:
+            logger.error(f"Error in smart_fall_detection: {e}")
+            return []
+
+        return results
 
     def process_classification_batch(self, poses, track_ids):
         """
@@ -274,8 +398,8 @@ class OptimizedFallDetector:
 
     def extract_pose_features_fast(self, frame, detection):
         """
-        Fast pose feature extraction with reduced computational overhead.
-        Optimizes feature extraction by using smaller image sizes, reducing feature dimensions.
+        Fast pose feature extraction with consistent preprocessing.
+        FIXED: Use standard 224x224 input size for consistency.
 
         Args:
             frame: Current video frame
@@ -285,38 +409,53 @@ class OptimizedFallDetector:
             numpy.ndarray: Extracted pose features or None if extraction fails
         """
         try:
-            # Use smaller image sizes for faster processing
+            # Extract bounding box
             bbox = detection.get('bbox', (0, 0, 100, 100))
             x1, y1, x2, y2 = bbox
 
             # Ensure valid bounding box
             if x2 <= x1 or y2 <= y1:
+                logger.debug("Invalid bounding box dimensions")
                 return None
 
+            # Validate coordinates against frame dimensions
+            frame_h, frame_w = frame.shape[:2]
+            x1 = max(0, min(x1, frame_w))
+            y1 = max(0, min(y1, frame_h))
+            x2 = max(x1 + 1, min(x2, frame_w))
+            y2 = max(y1 + 1, min(y2, frame_h))
+
+            # Extract person crop
             person_crop = frame[y1:y2, x1:x2]
 
             if person_crop.size == 0:
+                logger.debug("Empty person crop")
                 return None
 
-            # Use smaller input size (112x112 instead of 224x224)
-            person_crop = cv2.resize(person_crop, (112, 112))
+            # FIXED: Use consistent input size (224x224)
+            person_crop = cv2.resize(person_crop, STANDARD_INPUT_SIZE)
+            person_crop = person_crop.astype(np.uint8)
 
-            # Simplified pose detection
+            # Pose detection with proper YOLO input size
             if self.pose_model is not None:
-                results = self.pose_model(person_crop, verbose=False, imgsz=128)  # YOLO requires multiple of 32
+                results = self.pose_model(person_crop, verbose=False, imgsz=YOLO_INPUT_SIZE)
 
-                # Fast feature extraction
+                # Feature extraction
                 if results[0].keypoints is not None:
                     keypoints = results[0].keypoints.xy.cpu().numpy().flatten()
-                    # Keep 34 features to match the trained classifier
+                    # Ensure exactly 34 features for classifier compatibility
                     if len(keypoints) >= 34:
                         features = keypoints[:34]
                     else:
-                        # Pad to 34 features if we have fewer
-                        features = np.pad(keypoints, (0, 34 - len(keypoints)), 'constant')
-                    return features
+                        # Pad to 34 features if fewer detected
+                        features = np.pad(keypoints, (0, 34 - len(keypoints)), 'constant', constant_values=0)
 
-            return np.zeros(34)  # Return 34 features to match classifier expectation
+                    logger.debug(f"Extracted {len(features)} features")
+                    return features.astype(np.float32)
+
+            # Return zero vector if no keypoints detected
+            logger.debug("No keypoints detected, returning zero features")
+            return np.zeros(34, dtype=np.float32)
 
         except Exception as e:
             logger.debug(f"Feature extraction error: {e}")
@@ -397,27 +536,53 @@ class OptimizedFallDetector:
 
     def get_performance_stats(self):
         """
-        Get performance statistics for monitoring system health.
-
-        Returns:
-            dict: Dictionary containing performance metrics
+        IMPROVED: Get comprehensive performance statistics.
         """
         return {
             'classification_queue_size': self.pose_queue.qsize(),
             'cached_classifications': len(self.last_classifications),
             'tracked_objects': len(self.track_histories),
-            'classification_thread_alive': self.classification_thread.is_alive() if self.classification_thread else False
+            'classification_thread_alive': self.classification_thread.is_alive() if self.classification_thread else False,
+            'processed_tasks': self.processed_tasks,
+            'dropped_tasks': self.dropped_tasks,
+            'queue_utilization': f"{self.pose_queue.qsize()}/{self.max_queue_size}"
         }
 
     def cleanup(self):
-        """Clean up resources and stop background threads."""
+        """
+        IMPROVED: Enhanced cleanup with better resource management.
+        """
+        logger.info("Starting optimized fall detector cleanup...")
+
+        # Stop thread
         self.thread_running = False
-        if self.classification_thread:
-            try:
-                self.pose_queue.put_nowait(None)
-            except:
-                pass
-            self.classification_thread.join(timeout=1.0)
+
+        # Clear queue and send shutdown signal
+        try:
+            # Clear existing items
+            while not self.pose_queue.empty():
+                try:
+                    self.pose_queue.get_nowait()
+                except:
+                    break
+
+            # Send shutdown signal
+            self.pose_queue.put_nowait(None)
+        except:
+            pass
+
+        # Wait for thread to finish
+        if self.classification_thread and self.classification_thread.is_alive():
+            self.classification_thread.join(timeout=2.0)
+            if self.classification_thread.is_alive():
+                logger.warning("Classification thread did not shut down gracefully")
+
+        # Clear caches
+        self.classification_cache.clear()
+        self.last_classifications.clear()
+        self.track_histories.clear()
+
+        logger.info(f"Cleanup completed. Stats - Processed: {self.processed_tasks}, Dropped: {self.dropped_tasks}")
 
 
 class AlertSystem:
