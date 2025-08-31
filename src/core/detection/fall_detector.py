@@ -1,668 +1,575 @@
 # src/core/detection/fall_detector.py
-
-import asyncio
-import logging
-import time
-import textwrap
-from asyncio import Queue, Lock
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+"""
+Unified Fall Detection System
+Combines all optimizations and fixes the classifier integration issue
+"""
 
 import cv2
-import joblib
 import numpy as np
+import logging
+import time
+from collections import defaultdict, deque
+from pathlib import Path
+import joblib
 from ultralytics import YOLO
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Tuple, Optional, Any
 
 from config.settings import get_settings
-from src.core.analysis.danger_calculator import calculate_danger
-from src.core.analysis.gpt_analyzer import analyze_image
-from src.core.analysis.location_service import getLoc, get_address
-from src.core.detection.optimized_fall_detector import OptimizedFallDetector
 from src.core.tracking.sort_tracker import SORT
 from src.core.utils.cache_manager import DetectionCache
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Get configuration settings
-settings = get_settings()
-
-# Initialize detection cache
-detection_cache = DetectionCache(cache_dir=settings.CACHE_DIR)
-
-# Thread pool for async operations
-executor = ThreadPoolExecutor(max_workers=2)
-task_queue = Queue()
-results_lock = Lock()
-analyst_results = {}
-
-# Location data
-try:
-    latitude, longitude = getLoc()
-    global_coords = f"Lat: {latitude:.4f}, Lon: {longitude:.4f}"
-    global_address = get_address(latitude, longitude)
-    logger.info(f"Location initialized: {global_coords}")
-except Exception as e:
-    logger.warning(f"Failed to get location: {e}")
-    latitude, longitude = 0.0, 0.0
-    global_coords = "Location unavailable"
-    global_address = "Address unavailable"
-
-# Detection settings
-CONFIDENCE_THRESHOLD_DETECTION = settings.CONFIDENCE_THRESHOLD
+# Constants
+STANDARD_INPUT_SIZE = (224, 224)  # Classifier training size
+YOLO_INPUT_SIZE = 224  # Must be multiple of 32
+PERSON_CLASS_ID = 0  # COCO dataset person class
 
 
-def load_yolo_model(model_path=None):
+class UnifiedFallDetector:
     """
-    Load YOLO model from specified path.
-
-    Args:
-        model_path: Path to YOLO model file
-
-    Returns:
-        Loaded YOLO model
+    Unified fall detection system with proper bounding box extraction.
+    Fixes Issue #19: Classifier receives person bounding box instead of full frame.
     """
-    if model_path is None:
-        model_path = settings.YOLO_MODEL_PATH
 
-    if not Path(model_path).exists():
-        raise FileNotFoundError(f"YOLO model not found: {model_path}")
+    def __init__(self, settings=None):
+        """Initialize the unified fall detector."""
+        self.settings = settings or get_settings()
 
-    logger.info(f"Loading YOLO model from: {model_path}")
-    return YOLO(str(model_path))
+        # Model paths
+        self.yolo_path = self.settings.YOLO_MODEL_PATH
+        self.pose_path = self.settings.POSE_MODEL_PATH
+        self.classifier_path = self.settings.CLASSIFIER_PATH
 
+        # Performance parameters
+        self.confidence_threshold = self.settings.CONFIDENCE_THRESHOLD
+        self.fall_confirmation_frames = 15
+        self.classifier_interval = 10  # Frames between classifications
 
-def load_classifier(classifier_path=None):
-    """
-    Load pose classifier from specified path.
+        # Load models
+        self._load_models()
 
-    Args:
-        classifier_path: Path to classifier file
+        # Initialize components
+        self.tracker = self._init_tracker()
+        self.cache = DetectionCache(cache_dir=self.settings.CACHE_DIR)
 
-    Returns:
-        Loaded classifier model
-    """
-    if classifier_path is None:
-        classifier_path = settings.CLASSIFIER_PATH
+        # State management
+        self.person_states = {}  # Track each person's state
+        self.frame_count = 0
 
-    if not Path(classifier_path).exists():
-        logger.warning(f"Classifier not found: {classifier_path}")
-        return None
+        # Performance monitoring
+        self.stats = {
+            'frames_processed': 0,
+            'detections': 0,
+            'classifications': 0,
+            'alerts': 0
+        }
 
-    logger.info(f"Loading classifier from: {classifier_path}")
-    return joblib.load(str(classifier_path))
+    def _load_models(self):
+        """Load all required models."""
+        try:
+            # YOLO detection model
+            logger.info(f"Loading YOLO model: {self.yolo_path}")
+            self.yolo_model = YOLO(str(self.yolo_path))
 
+            # Pose model for keypoint extraction
+            logger.info(f"Loading pose model: {self.pose_path}")
+            self.pose_model = YOLO(str(self.pose_path))
 
-async def analyze_image_async(track_id, frame, bbox=None):
-    """
-    Asynchronously execute analyze_image with proper bounding box extraction.
-
-    Args:
-        track_id: Unique track identifier
-        frame: Video frame to analyze
-        bbox: Person bounding box (x1, y1, x2, y2) - NEW PARAMETER
-
-    Returns:
-        Analysis result dictionary
-    """
-    try:
-        logger.debug(f"Starting analysis for track ID {track_id}")
-
-        # CRITICAL FIX: Extract person crop if bbox provided
-        if bbox is not None:
-            x1, y1, x2, y2 = bbox
-            # Ensure valid coordinates
-            height, width = frame.shape[:2]
-            x1 = max(0, min(x1, width))
-            y1 = max(0, min(y1, height))
-            x2 = max(x1 + 1, min(x2, width))
-            y2 = max(y1 + 1, min(y2, height))
-
-            # Extract person crop
-            person_crop = frame[y1:y2, x1:x2]
-
-            # Validate crop size
-            if person_crop.size > 0:
-                analysis_frame = person_crop
-                logger.debug(f"Using person crop: {person_crop.shape} for track {track_id}")
+            # Classifier for fall verification
+            if Path(self.classifier_path).exists():
+                logger.info(f"Loading classifier: {self.classifier_path}")
+                self.classifier = joblib.load(str(self.classifier_path))
             else:
-                logger.warning(f"Invalid person crop for track {track_id}, using full frame")
-                analysis_frame = frame
-        else:
-            # Fallback to full frame if no bbox
-            analysis_frame = frame
-            logger.debug(f"No bbox provided for track {track_id}, using full frame")
+                logger.warning("Classifier not found, fall verification disabled")
+                self.classifier = None
 
-        # Execute analysis on the appropriate frame/crop
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(executor, analyze_image, analysis_frame)
-        logger.debug(f"Analysis completed for track ID {track_id}")
-
-        async with results_lock:
-            analyst_results[track_id] = result
-        return result
-
-    except Exception as e:
-        logger.error(f"Error during analyze_image_async for track ID {track_id}: {e}")
-        return {}
-
-
-async def process_task_queue():
-    """
-    Process analysis tasks from the queue asynchronously.
-    """
-    while True:
-        try:
-            # Use timeout to prevent hanging
-            try:
-                track_id, frame = await asyncio.wait_for(task_queue.get(), timeout=1.0)
-                logger.debug(f"Processing task for track ID: {track_id}")
-
-                result = await analyze_image_async(track_id, frame)
-
-                async with results_lock:
-                    analyst_results[track_id] = result
-
-                task_queue.task_done()
-
-            except asyncio.TimeoutError:
-                # No task available, continue waiting
-                continue
-
-        except asyncio.CancelledError:
-            # Task was cancelled, exit gracefully
-            logger.info("Task queue processing cancelled")
-            break
         except Exception as e:
-            logger.error(f"Error in task queue processing: {e}")
-            try:
-                task_queue.task_done()
-            except ValueError:
-                # task_done called too many times, ignore
-                pass
+            logger.error(f"Model loading failed: {e}")
+            raise
 
+    def _init_tracker(self):
+        """Initialize SORT tracker."""
+        tracker_config = self.settings.TRACKING_SETTINGS
+        return SORT(
+            max_miss=tracker_config['max_miss'],
+            min_hits=tracker_config['min_hits'],
+            iou_threshold=tracker_config['iou_threshold']
+        )
 
-async def track_objects_with_yolo(frame, tracking_model, pose_model, classifier, mot_tracker, frame_idx):
-    """
-    Perform YOLO tracking, pose estimation, danger calculation, and analysis.
+    def process_frame(self, frame: np.ndarray) -> Dict[str, Any]:
+        """
+        Process a single frame with proper bounding box extraction.
 
-    Args:
-        frame: Input video frame
-        tracking_model: YOLO tracking model
-        pose_model: YOLO pose estimation model
-        classifier: Pose classifier model
-        mot_tracker: SORT tracker instance
-        frame_idx: Current frame index
+        Args:
+            frame: Input video frame
 
-    Returns:
-        Tuple of (processed_frame, falling_durations)
-    """
-    global global_coords, global_address
-
-    # Perform object detection using YOLO
-    try:
-        results = tracking_model(frame, imgsz=320, verbose=False)
-        boxes = results[0].boxes.xyxy.cpu().numpy()
-        confidences = results[0].boxes.conf.cpu().numpy()
-        classes = results[0].boxes.cls.cpu().numpy()
-    except Exception as e:
-        logger.error(f"YOLO detection failed: {e}")
-        return frame, {}
-
-    # Initialize tracking attributes if not present
-    if not hasattr(mot_tracker, "falling_durations"):
-        mot_tracker.falling_durations = {}
-    if not hasattr(mot_tracker, "first_analysis_done"):
-        mot_tracker.first_analysis_done = {}
-
-    # Filter valid detections
-    valid_detections = []
-    for box, confidence, cls in zip(boxes, confidences, classes):
-        if confidence > CONFIDENCE_THRESHOLD_DETECTION:
-            valid_detections.append([*box, int(cls)])
-
-    # Update object trackers
-    tracks = mot_tracker.update(valid_detections)
-    danger_values = []
-
-    for track in tracks:
-        x1, y1, x2, y2, track_id, cls = map(int, track)
+        Returns:
+            Dictionary containing detection results and alerts
+        """
+        self.frame_count += 1
+        results = {
+            'frame_id': self.frame_count,
+            'detections': [],
+            'alerts': [],
+            'stats': {}
+        }
 
         try:
-            class_name = tracking_model.names[cls]
-        except (IndexError, KeyError):
-            class_name = "unknown"
-            logger.warning(f"Unknown class ID: {cls}")
+            # Step 1: Detect persons in frame
+            detections = self._detect_persons(frame)
 
-        # Initialize tracking data for new tracks
-        if track_id not in mot_tracker.falling_durations:
-            mot_tracker.falling_durations[track_id] = 0
-            mot_tracker.first_analysis_done[track_id] = False
+            if not detections:
+                return results
 
-        # Update falling duration based on class
-        if class_name == "falling_person":
-            mot_tracker.falling_durations[track_id] += 1
-        else:
-            mot_tracker.falling_durations[track_id] = max(0, mot_tracker.falling_durations[track_id] - 1)
+            # Step 2: Track persons across frames
+            tracks = self._track_persons(detections)
 
-        # Analysis logic
-        async with results_lock:
-            analysis_result = analyst_results.get(track_id, {})
+            # Step 3: Process each tracked person
+            for track in tracks:
+                person_result = self._process_person(frame, track)
+                if person_result:
+                    results['detections'].append(person_result)
 
-            # Trigger first analysis
-            if frame_idx == 0 and not mot_tracker.first_analysis_done[track_id]:
-                logger.debug(f"Triggering first analysis for track ID {track_id}")
-                await task_queue.put((track_id, frame))
-                mot_tracker.first_analysis_done[track_id] = True
+                    # Check for alerts
+                    if person_result.get('alert_triggered', False):
+                        results['alerts'].append(self._create_alert(person_result))
 
-            # Update analysis for falling persons
-            elif class_name == "falling_person" and mot_tracker.falling_durations[track_id] % 100 == 0:
-                danger_value = calculate_danger(analysis_result, mot_tracker.falling_durations[track_id])
-                danger_values.append(danger_value)
-                logger.debug(f"Danger value calculated: {danger_value:.2f}")
+            # Update statistics
+            self.stats['frames_processed'] += 1
+            self.stats['detections'] += len(results['detections'])
+            results['stats'] = self.stats.copy()
 
-                logger.debug(f"Updating analysis for track ID {track_id}")
-                await task_queue.put((track_id, frame))
-
-        # Pose estimation and classification if classifier is available
-        prediction_label = "Unknown"
-        if classifier is not None:
-            try:
-                person_box = frame[y1:y2, x1:x2]
-                if person_box.size > 0:
-                    person_patch = cv2.resize(person_box, (224, 224))
-                    person_patch = person_patch.astype(np.uint8)
-
-                    pose_results = pose_model(person_patch)
-                    keypoints = pose_results[0].keypoints
-
-                    if keypoints is not None:
-                        features = keypoints.xy.cpu().numpy().flatten()
-                        features = np.pad(features, (0, 34 - len(features)), 'constant') if len(
-                            features) < 34 else features[:34]
-                    else:
-                        features = np.zeros(34)
-
-                    prediction = classifier.predict([features])[0]
-                    prediction_label = "Need Help" if prediction == 0 else "Fine"
-
-            except Exception as e:
-                logger.error(f"Pose classification failed for track {track_id}: {e}")
-
-        # Display bounding box and information
-        color = (0, 0, 255) if class_name == "falling_person" else (0, 255, 0)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-        # Main label
-        label = f"ID: {track_id} | {class_name}: {mot_tracker.falling_durations[track_id]} | {prediction_label}"
-        cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-        # Display analysis results
-        display_analysis_results(frame, analysis_result, x2 + 10, y1 + 20)
-
-    # Display danger score if available
-    if danger_values:
-        avg_danger = sum(danger_values) / len(danger_values)
-        cv2.putText(frame, f"Danger: {avg_danger:.2f}", (frame.shape[1] - 200, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
-    # Display frame information
-    cv2.putText(frame, f"Frame: {frame_idx}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-    cv2.putText(frame, global_coords, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-
-    # Display address with text wrapping
-    wrapped_address = textwrap.wrap(global_address, width=30)
-    y_start = 90
-    for i, line in enumerate(wrapped_address):
-        y_offset = y_start + i * 20
-        cv2.putText(frame, line, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-
-    return frame, mot_tracker.falling_durations
-
-
-def display_analysis_results(frame, analysis_result, start_x, start_y):
-    """
-    Display GPT analysis results on the frame.
-
-    Args:
-        frame: Video frame to draw on
-        analysis_result: Analysis result dictionary
-        start_x: Starting x coordinate
-        start_y: Starting y coordinate
-    """
-    text_x, text_y = start_x, start_y
-
-    for key, value in analysis_result.items():
-        if isinstance(value, dict):
-            for sub_key, sub_value in value.items():
-                line = f"{sub_key}: {sub_value}"
-                cv2.putText(frame, line, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-                text_y += 15
-        elif isinstance(value, list):
-            line = f"{key}:"
-            cv2.putText(frame, line, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-            text_y += 15
-            for item in value:
-                cv2.putText(frame, f"- {item}", (text_x + 10, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-                text_y += 15
-        else:
-            line = f"{key}: {value}"
-            cv2.putText(frame, line, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-            text_y += 15
-
-
-async def process_single_video(video_source, tracking_model, pose_model, classifier, mot_tracker):
-    """
-    Process a single video or camera feed asynchronously with optimized classifier integration.
-
-    Args:
-        video_source: Video file path or camera index
-        tracking_model: YOLO tracking model
-        pose_model: YOLO pose model
-        classifier: Pose classifier
-        mot_tracker: SORT tracker instance
-    """
-    # Initialize optimized fall detector
-    optimized_detector = OptimizedFallDetector(settings)
-    optimized_detector.classifier = classifier
-    optimized_detector.pose_model = pose_model
-
-    # Determine if source is camera or video file
-    if isinstance(video_source, int) or str(video_source).isdigit():
-        cap = cv2.VideoCapture(int(video_source))
-        use_cache = False
-        logger.info(f"Processing camera feed: {video_source}")
-    else:
-        cap = cv2.VideoCapture(str(video_source))
-        use_cache = settings.CACHE_ENABLED
-        logger.info(f"Processing video file: {video_source}")
-
-    if not cap.isOpened():
-        logger.error(f"Unable to open video source: {video_source}")
-        return
-
-    # Get model name for cache key
-    try:
-        model_name = Path(tracking_model.ckpt_path).name if hasattr(tracking_model, 'ckpt_path') else "yolo_model"
-    except:
-        model_name = "yolo_model"
-
-    # Cache management
-    cached_detections = None
-    current_detections = {}
-
-    if use_cache and detection_cache.cache_exists(video_source, model_name):
-        try:
-            cached_detections = detection_cache.load_detections(video_source, model_name)
-            logger.info(f"Using cached detections for {video_source}")
         except Exception as e:
-            logger.warning(f"Failed to load cache: {e}")
+            logger.error(f"Frame processing error: {e}")
 
-    # Performance tracking
-    frame_idx = 0
-    start_time = time.time()
-    detection_time = 0
-    total_frames = 0
+        return results
 
-    # Simple tracking for demo - use consistent track IDs
-    track_id_mapping = {}  # Map detection index to consistent track ID
-    next_track_id = 0
+    def _detect_persons(self, frame: np.ndarray) -> List[Dict]:
+        """
+        Detect persons in frame using YOLO.
 
-    try:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
+        Args:
+            frame: Input frame
 
-            total_frames += 1
-            detection_start = time.time()
+        Returns:
+            List of detection dictionaries
+        """
+        detections = []
 
-            # Get YOLO detections
-            try:
-                results = tracking_model(frame, imgsz=320, verbose=False)
-                if results[0].boxes is not None:
-                    boxes = results[0].boxes.xyxy.cpu().numpy()
-                    confidences = results[0].boxes.conf.cpu().numpy()
-                    classes = results[0].boxes.cls.cpu().numpy()
-                else:
-                    boxes = np.array([])
-                    confidences = np.array([])
-                    classes = np.array([])
-            except Exception as e:
-                logger.error(f"YOLO detection error: {e}")
-                boxes = np.array([])
-                confidences = np.array([])
-                classes = np.array([])
+        try:
+            # Run YOLO detection
+            results = self.yolo_model(frame, imgsz=320, verbose=False)
 
-            # Prepare detections for optimized processor
-            detections = []
-            for i, (box, confidence, cls) in enumerate(zip(boxes, confidences, classes)):
-                if confidence > CONFIDENCE_THRESHOLD_DETECTION:
-                    x1, y1, x2, y2 = map(int, box)
+            if results[0].boxes is not None:
+                boxes = results[0].boxes.xyxy.cpu().numpy()
+                confidences = results[0].boxes.conf.cpu().numpy()
+                classes = results[0].boxes.cls.cpu().numpy()
 
-                    # Ensure valid bounding box
-                    if x2 > x1 and y2 > y1:
-                        class_name = tracking_model.names.get(int(cls), 'unknown') if hasattr(tracking_model,
-                                                                                              'names') else 'unknown'
-
-                        # Use consistent track ID mapping
-                        detection_key = f"{x1}_{y1}_{x2}_{y2}"  # Simple spatial mapping
-                        if detection_key not in track_id_mapping:
-                            track_id_mapping[detection_key] = next_track_id
-                            next_track_id += 1
-
-                        track_id = track_id_mapping[detection_key]
-
+                # Filter for persons only
+                for box, conf, cls in zip(boxes, confidences, classes):
+                    if int(cls) == PERSON_CLASS_ID and conf > self.confidence_threshold:
+                        x1, y1, x2, y2 = map(int, box)
                         detections.append({
                             'bbox': (x1, y1, x2, y2),
-                            'confidence': float(confidence),
-                            'class_name': class_name,
-                            'track_id': track_id
+                            'confidence': float(conf),
+                            'class': 'person'
                         })
 
-            # Use optimized fall detection
-            try:
-                fall_results = optimized_detector.smart_fall_detection(frame, detections, frame_idx)
-
-                # Add bbox information to results for drawing
-                for i, result in enumerate(fall_results):
-                    if i < len(detections):
-                        result['bbox'] = detections[i]['bbox']
-
-            except Exception as e:
-                logger.error(f"Optimized fall detection error: {e}")
-                fall_results = []
-
-            # Draw results on frame
-            try:
-                frame = draw_optimized_results(frame, fall_results)
-            except Exception as e:
-                logger.error(f"Drawing results error: {e}")
-
-            detection_time += time.time() - detection_start
-
-            # Display frame
-            cv2.imshow("Optimized Fall Detection", frame)
-
-            frame_idx += 1
-
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                logger.info("Processing stopped by user")
-                break
-
-    except Exception as e:
-        logger.error(f"Error during video processing: {e}")
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
-        optimized_detector.cleanup()
-
-    # Print performance statistics
-    total_time = time.time() - start_time
-    if total_frames > 0:
-        logger.info(f"Optimized Performance metrics:")
-        logger.info(f"  Total frames: {total_frames}")
-        logger.info(f"  Total time: {total_time:.2f}s")
-        logger.info(f"  Average FPS: {total_frames / total_time:.2f}")
-        logger.info(f"  Detection time: {detection_time:.2f}s ({detection_time / total_time * 100:.1f}%)")
-
-        # Get optimized detector stats
-        try:
-            stats = optimized_detector.get_performance_stats()
-            logger.info(f"  Classifier queue size: {stats['classification_queue_size']}")
-            logger.info(f"  Cached classifications: {stats['cached_classifications']}")
         except Exception as e:
-            logger.error(f"Error getting performance stats: {e}")
+            logger.error(f"Detection error: {e}")
 
+        return detections
 
-def draw_optimized_results(frame, fall_results):
-    """
-    Draw optimized fall detection results on frame.
+    def _track_persons(self, detections: List[Dict]) -> List[np.ndarray]:
+        """
+        Track detected persons using SORT tracker.
 
-    Args:
-        frame: Video frame to draw on
-        fall_results: Results from OptimizedFallDetector
+        Args:
+            detections: List of detection dictionaries
 
-    Returns:
-        Modified frame with drawn results
-    """
-    # Limit the number of information displays to prevent clutter
-    max_displays = 3
-    active_tracks = []
+        Returns:
+            List of tracks with IDs
+        """
+        if not detections:
+            return []
 
-    for result in fall_results:
-        track_id = result['track_id']
-        class_name = result['class_name']
-        is_falling = result['is_falling']
-        classification = result['classification']
-        danger_level = result['danger_level']
-        needs_help = result['needs_help']
+        # Convert to SORT format: [[x1,y1,x2,y2,cls]]
+        det_array = []
+        for det in detections:
+            x1, y1, x2, y2 = det['bbox']
+            det_array.append([x1, y1, x2, y2, 0])  # cls=0 for person
 
-        # Choose color based on danger level
-        if needs_help:
-            color = (0, 0, 255)  # Red for high danger
-        elif is_falling:
-            color = (0, 165, 255)  # Orange for falling
-        elif danger_level > 0.3:
-            color = (0, 255, 255)  # Yellow for medium danger
+        # Update tracker
+        tracks = self.tracker.update(det_array)
+        return tracks
+
+    def _process_person(self, frame: np.ndarray, track: np.ndarray) -> Optional[Dict]:
+        """
+        Process individual tracked person with PROPER BOUNDING BOX EXTRACTION.
+
+        This is the CRITICAL FIX: Extract person region before classification.
+
+        Args:
+            frame: Full video frame
+            track: Track array [x1, y1, x2, y2, track_id, cls]
+
+        Returns:
+            Person processing result dictionary
+        """
+        x1, y1, x2, y2, track_id, cls = map(int, track)
+
+        # Initialize person state if new
+        if track_id not in self.person_states:
+            self.person_states[track_id] = {
+                'fall_history': deque(maxlen=30),
+                'last_classification': None,
+                'last_classification_frame': 0,
+                'fall_start_frame': None,
+                'alert_sent': False
+            }
+
+        state = self.person_states[track_id]
+
+        # CRITICAL: Extract person bounding box
+        person_crop = self._extract_person_region(frame, (x1, y1, x2, y2))
+
+        if person_crop is None:
+            return None
+
+        # Classify if needed (not every frame for performance)
+        classification = None
+        if self.classifier and (self.frame_count - state['last_classification_frame']) >= self.classifier_interval:
+            classification = self._classify_person(person_crop)
+            state['last_classification'] = classification
+            state['last_classification_frame'] = self.frame_count
+            self.stats['classifications'] += 1
         else:
-            color = (0, 255, 0)  # Green for safe
+            classification = state['last_classification']
 
-        # Draw bounding box if bbox information is available
-        if 'bbox' in result:
-            x1, y1, x2, y2 = result['bbox']
+        # Update fall history
+        is_fall = self._is_fall_posture(person_crop, classification)
+        state['fall_history'].append(is_fall)
+
+        # Check for sustained fall
+        alert_triggered = False
+        if self._check_sustained_fall(state):
+            if not state['alert_sent']:
+                alert_triggered = True
+                state['alert_sent'] = True
+                self.stats['alerts'] += 1
+                logger.warning(f"ALERT: Person {track_id} has fallen and needs help!")
+        else:
+            state['alert_sent'] = False
+
+        return {
+            'track_id': track_id,
+            'bbox': (x1, y1, x2, y2),
+            'classification': classification,
+            'is_falling': is_fall,
+            'fall_duration': sum(state['fall_history']),
+            'alert_triggered': alert_triggered
+        }
+
+    def _extract_person_region(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
+        """
+        CRITICAL METHOD: Extract person region from frame.
+        This fixes the main issue - classifier should receive only the person, not full frame.
+
+        Args:
+            frame: Full video frame
+            bbox: Person bounding box (x1, y1, x2, y2)
+
+        Returns:
+            Cropped and resized person region
+        """
+        try:
+            x1, y1, x2, y2 = bbox
+
+            # Validate bounding box
+            h, w = frame.shape[:2]
+            x1 = max(0, min(x1, w))
+            y1 = max(0, min(y1, h))
+            x2 = max(x1 + 1, min(x2, w))
+            y2 = max(y1 + 1, min(y2, h))
+
+            # Extract person region
+            person_crop = frame[y1:y2, x1:x2]
+
+            if person_crop.size == 0:
+                logger.debug("Empty person crop")
+                return None
+
+            # Resize to standard size for classifier
+            person_crop = cv2.resize(person_crop, STANDARD_INPUT_SIZE)
+
+            return person_crop
+
+        except Exception as e:
+            logger.error(f"Bounding box extraction error: {e}")
+            return None
+
+    def _classify_person(self, person_crop: np.ndarray) -> Dict[str, Any]:
+        """
+        Classify person pose using the trained classifier.
+
+        Args:
+            person_crop: Extracted person region (224x224)
+
+        Returns:
+            Classification result dictionary
+        """
+        try:
+            # Extract pose features
+            features = self._extract_pose_features(person_crop)
+
+            if features is None or self.classifier is None:
+                return {'class': 'unknown', 'confidence': 0.0}
+
+            # Classify
+            prediction = self.classifier.predict([features])[0]
+
+            # Get confidence if available
+            confidence = 1.0
+            if hasattr(self.classifier, 'predict_proba'):
+                probs = self.classifier.predict_proba([features])[0]
+                confidence = float(max(probs))
+
+            # Map prediction to class name
+            class_name = 'need_help' if prediction == 0 else 'fine'
+
+            return {
+                'class': class_name,
+                'confidence': confidence
+            }
+
+        except Exception as e:
+            logger.error(f"Classification error: {e}")
+            return {'class': 'unknown', 'confidence': 0.0}
+
+    def _extract_pose_features(self, person_crop: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Extract pose features from person region.
+
+        Args:
+            person_crop: Person region (224x224)
+
+        Returns:
+            Feature vector for classifier
+        """
+        try:
+            # Run pose detection
+            results = self.pose_model(person_crop, verbose=False, imgsz=YOLO_INPUT_SIZE)
+
+            if results[0].keypoints is not None:
+                # Extract keypoint coordinates
+                keypoints = results[0].keypoints.xy.cpu().numpy().flatten()
+
+                # Ensure correct feature dimension (34 for compatibility)
+                if len(keypoints) >= 34:
+                    features = keypoints[:34]
+                else:
+                    features = np.pad(keypoints, (0, 34 - len(keypoints)), 'constant')
+
+                return features.astype(np.float32)
+
+            return np.zeros(34, dtype=np.float32)
+
+        except Exception as e:
+            logger.debug(f"Feature extraction error: {e}")
+            return None
+
+    def _is_fall_posture(self, person_crop: np.ndarray, classification: Optional[Dict]) -> bool:
+        """
+        Determine if person is in fall posture.
+
+        Args:
+            person_crop: Person region
+            classification: Classification result
+
+        Returns:
+            True if fall detected
+        """
+        if classification and classification.get('class') == 'need_help':
+            return classification.get('confidence', 0) > 0.6
+        return False
+
+    def _check_sustained_fall(self, state: Dict) -> bool:
+        """
+        Check if fall has been sustained long enough to trigger alert.
+
+        Args:
+            state: Person state dictionary
+
+        Returns:
+            True if sustained fall detected
+        """
+        if len(state['fall_history']) < self.fall_confirmation_frames:
+            return False
+
+        # Check recent history
+        recent_falls = sum(state['fall_history'][-self.fall_confirmation_frames:])
+        threshold = self.fall_confirmation_frames * 0.7  # 70% of frames must show fall
+
+        return recent_falls >= threshold
+
+    def _create_alert(self, person_result: Dict) -> Dict:
+        """
+        Create alert message for fallen person.
+
+        Args:
+            person_result: Person detection result
+
+        Returns:
+            Alert dictionary
+        """
+        return {
+            'timestamp': time.time(),
+            'track_id': person_result['track_id'],
+            'bbox': person_result['bbox'],
+            'message': f"Person {person_result['track_id']} has fallen and may need help",
+            'confidence': person_result.get('classification', {}).get('confidence', 0.0)
+        }
+
+    def draw_results(self, frame: np.ndarray, results: Dict) -> np.ndarray:
+        """
+        Draw detection results on frame.
+
+        Args:
+            frame: Video frame
+            results: Detection results
+
+        Returns:
+            Annotated frame
+        """
+        for detection in results['detections']:
+            x1, y1, x2, y2 = detection['bbox']
+            track_id = detection['track_id']
+
+            # Choose color based on status
+            if detection.get('alert_triggered'):
+                color = (0, 0, 255)  # Red for alert
+                label = f"ALERT: Person {track_id}"
+            elif detection.get('is_falling'):
+                color = (0, 165, 255)  # Orange for falling
+                label = f"Falling: Person {track_id}"
+            else:
+                color = (0, 255, 0)  # Green for normal
+                label = f"Person {track_id}"
+
+            # Draw bounding box
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-            # Draw label above bounding box
-            label = f"ID:{track_id} {class_name}"
-            cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            # Add label with classification info
+            if detection.get('classification'):
+                cls_info = detection['classification']
+                label += f" [{cls_info['class']}: {cls_info['confidence']:.2f}]"
 
-        # Only show detailed info for active/important tracks
-        if len(active_tracks) < max_displays and (needs_help or is_falling or danger_level > 0.1):
-            active_tracks.append(result)
+            cv2.putText(frame, label, (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-    # Draw information text on left side only for active tracks
-    for idx, result in enumerate(active_tracks):
-        track_id = result['track_id']
-        class_name = result['class_name']
-        classification = result['classification']
-        danger_level = result['danger_level']
-        needs_help = result['needs_help']
+        # Draw statistics
+        stats_text = f"Frame: {results['frame_id']} | Detections: {len(results['detections'])} | Alerts: {len(results['alerts'])}"
+        cv2.putText(frame, stats_text, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-        # Choose color based on danger level
-        if needs_help:
-            color = (0, 0, 255)
-        elif result['is_falling']:
-            color = (0, 165, 255)
-        elif danger_level > 0.3:
-            color = (0, 255, 255)
-        else:
-            color = (0, 255, 0)
+        return frame
 
-        y_offset = 30 + idx * 80  # Use index instead of track_id to prevent jumping
+    def process_video(self, video_path: str, output_path: Optional[str] = None, show: bool = False):
+        """
+        Process entire video file.
 
-        cv2.putText(frame, f"ID: {track_id}", (10, y_offset),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        cv2.putText(frame, f"Class: {class_name}", (10, y_offset + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-        cv2.putText(frame, f"Classification: {classification}", (10, y_offset + 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-        cv2.putText(frame, f"Danger: {danger_level:.2f}", (10, y_offset + 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        Args:
+            video_path: Path to input video
+            output_path: Path to save output video (optional)
+            show: Whether to display video during processing
+        """
+        cap = cv2.VideoCapture(video_path)
 
-    # Show global alerts
-    if any(result['needs_help'] for result in fall_results):
-        cv2.putText(frame, "NEEDS HELP!", (frame.shape[1] - 200, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+        # Get video properties
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    return frame
+        # Setup video writer if output path provided
+        writer = None
+        if output_path:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+        logger.info(f"Processing video: {video_path}")
+        start_time = time.time()
+
+        try:
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                # Process frame
+                results = self.process_frame(frame)
+
+                # Draw results
+                annotated_frame = self.draw_results(frame.copy(), results)
+
+                # Write to output
+                if writer:
+                    writer.write(annotated_frame)
+
+                # Display if requested
+                if show:
+                    cv2.imshow('Fall Detection', annotated_frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+
+                # Log alerts
+                for alert in results['alerts']:
+                    logger.warning(f"ALERT: {alert['message']}")
+
+        finally:
+            cap.release()
+            if writer:
+                writer.release()
+            if show:
+                cv2.destroyAllWindows()
+
+            elapsed = time.time() - start_time
+            total_frames = self.stats['frames_processed']
+            fps = total_frames / elapsed if elapsed > 0 else 0
+
+            logger.info(f"Processing complete: {total_frames} frames in {elapsed:.2f}s ({fps:.2f} FPS)")
+            logger.info(f"Statistics: {self.stats}")
+
+    def cleanup(self):
+        """Clean up resources."""
+        self.person_states.clear()
+        logger.info("Detector cleanup complete")
 
 
-async def process_videos(video_paths, tracking_model=None, pose_model=None, classifier=None):
+# Convenience function for quick testing
+def test_unified_detector(video_path: str):
     """
-    Process multiple videos asynchronously with optimized fall detection.
+    Test the unified fall detector.
 
     Args:
-        video_paths: List of video file paths
-        tracking_model: YOLO tracking model (optional, will load default)
-        pose_model: YOLO pose model (optional, will load default)
-        classifier: Pose classifier (optional, will load default)
+        video_path: Path to test video
     """
-    # Load models if not provided
-    if tracking_model is None:
-        tracking_model = load_yolo_model()
-    if pose_model is None:
-        pose_model = load_yolo_model(settings.POSE_MODEL_PATH)
-    if classifier is None:
-        classifier = load_classifier()
+    from config.settings import get_settings
 
-    # Initialize tracker using centralized SORT implementation
-    tracker_settings = settings.TRACKING_SETTINGS
-    mot_tracker = SORT(
-        max_miss=tracker_settings['max_miss'],
-        min_hits=tracker_settings['min_hits'],
-        iou_threshold=tracker_settings['iou_threshold']
-    )
-
-    # Start task queue processor
-    task_processor = asyncio.create_task(process_task_queue())
+    settings = get_settings()
+    detector = UnifiedFallDetector(settings)
 
     try:
-        # Process videos with optimized detector
-        tasks = [
-            process_single_video(video_path, tracking_model, pose_model, classifier, mot_tracker)
-            for video_path in video_paths
-        ]
-        await asyncio.gather(*tasks)
+        detector.process_video(video_path, show=True)
     finally:
-        # Clean up task processor
-        task_processor.cancel()
-        try:
-            await task_processor
-        except asyncio.CancelledError:
-            pass
+        detector.cleanup()
 
 
 if __name__ == "__main__":
-    # Test with configuration
-    logger.info("Starting fall detection system...")
+    import sys
 
-    try:
-        # Test video paths from settings
-        test_video = settings.TEST_VIDEO_PATH
-        if test_video and test_video.exists():
-            video_paths = [str(test_video)]
-        else:
-            # Use camera if no test video
-            video_paths = [0]
-            logger.info("No test video found, using camera")
-
-        # Run detection
-        asyncio.run(process_videos(video_paths))
-
-    except KeyboardInterrupt:
-        logger.info("Fall detection stopped by user")
-    except Exception as e:
-        logger.error(f"Fall detection failed: {e}")
-        raise
+    if len(sys.argv) > 1:
+        test_unified_detector(sys.argv[1])
+    else:
+        print("Usage: python fall_detector.py <video_path>")
