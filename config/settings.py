@@ -238,7 +238,7 @@ class Settings:
     @property
     def CONFIDENCE_THRESHOLD(self) -> float:
         """Get confidence threshold for detection."""
-        return float(os.getenv('CONFIDENCE_THRESHOLD', '0.5'))
+        return float(os.getenv('CONFIDENCE_THRESHOLD', '0.3'))
 
     @property
     def IOU_THRESHOLD(self) -> float:
