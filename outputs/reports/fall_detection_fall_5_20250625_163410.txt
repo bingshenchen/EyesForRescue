@@ -1,0 +1,68 @@
+Fall Detection Results
+Video: fall_5
+Total frames: 60
+Classes: person, falling_person, sitting_person, lying_person
+Confidence threshold: 0.5
+
+Frame-by-frame detection results:
+Frame_Index,Detected_Classes
+0,person
+1,person
+2,person
+3,person
+4,person
+5,person
+6,person
+7,person
+8,person
+9,person
+10,person
+11,person
+12,person
+13,person
+14,person
+15,person
+16,person
+17,person
+18,person
+19,person
+20,person
+21,person
+22,person
+23,person
+24,person
+25,person
+26,person
+27,person
+28,person
+29,person
+30,person
+31,person
+32,person
+33,person
+34,person
+35,person
+36,falling_person
+37,falling_person
+38,falling_person
+39,falling_person
+40,falling_person
+41,falling_person
+42,falling_person
+43,falling_person
+44,falling_person
+45,falling_person
+46,falling_person
+47,falling_person
+48,falling_person
+49,falling_person
+50,falling_person
+51,falling_person
+52,falling_person
+53,falling_person
+54,falling_person
+55,falling_person
+56,falling_person
+57,falling_person
+58,falling_person;falling_person
+59,falling_person;falling_person

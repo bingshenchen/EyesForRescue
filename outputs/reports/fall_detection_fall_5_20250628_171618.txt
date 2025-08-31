@@ -1,0 +1,11 @@
+Fall Detection Results
+==================================================
+Video: fall_5
+Model: best1.4.pt
+Total frames: 60
+Classes: person, falling_person, sitting_person, lying_person
+Confidence threshold: 0.5
+Timestamp: 2025-06-28 17:16:18.400096
+
+Frame-by-frame detection results:
+Frame_Index,Detected_Classes
