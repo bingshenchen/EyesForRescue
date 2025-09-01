@@ -1,14 +1,20 @@
-# src/core/analysis/gpt_analyzer.py
+# src/core/analysis/gpt_analyzer_async.py
 
 import base64
 import json
+import asyncio
+import threading
+import queue
 import mimetypes
 import logging
 from pathlib import Path
+from datetime import datetime
+from typing import Optional, Dict, Any, Union
 
 import cv2
 import numpy as np
-from openai import OpenAI
+from openai import AsyncOpenAI
+import aiohttp
 
 from config.settings import get_settings
 
@@ -19,245 +25,254 @@ logger = logging.getLogger(__name__)
 # Get configuration settings
 settings = get_settings()
 
-# Initialize OpenAI client
-client = None
+# Initialize async OpenAI client
+async_client = None
 if settings.OPENAI_API_KEY:
-    client = OpenAI(api_key=settings.OPENAI_API_KEY)
+    async_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 else:
     logger.warning("OpenAI API key not found. GPT analysis will not be available.")
 
 
-def encode_image_with_type(image):
-    """
-    Encode the image to Base64 and dynamically set the MIME type.
+class AsyncGPTAnalyzer:
+    """Asynchronous GPT analyzer to prevent video freezing."""
 
-    Args:
-        image: Either a file path (str) or OpenCV frame (np.ndarray)
+    def __init__(self):
+        self.analysis_queue = queue.Queue()
+        self.results_cache = {}
+        self.is_running = False
+        self.worker_thread = None
+        self.loop = None
 
-    Returns:
-        tuple: (mime_type, base64_image)
+    def start(self):
+        """Start the async analyzer worker thread."""
+        if not self.is_running:
+            self.is_running = True
+            self.worker_thread = threading.Thread(target=self._run_async_loop, daemon=True)
+            self.worker_thread.start()
+            logger.info("Async GPT analyzer started")
 
-    Raises:
-        ValueError: If input format is invalid or MIME type cannot be determined
-    """
-    if isinstance(image, (str, Path)):  # Image path
-        image_path = Path(image)
+    def stop(self):
+        """Stop the async analyzer worker thread."""
+        self.is_running = False
+        if self.worker_thread:
+            self.worker_thread.join(timeout=2)
+        logger.info("Async GPT analyzer stopped")
 
-        # Validate file exists
-        if not image_path.exists():
-            raise ValueError(f"Image file not found: {image_path}")
+    def _run_async_loop(self):
+        """Run the async event loop in a separate thread."""
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_until_complete(self._process_queue())
 
-        # Determine MIME type
-        mime_type, _ = mimetypes.guess_type(str(image_path))
-        if not mime_type or not mime_type.startswith('image/'):
-            raise ValueError(f"Cannot determine valid image MIME type for: {image_path}")
+    async def _process_queue(self):
+        """Process analysis requests from the queue."""
+        while self.is_running:
+            try:
+                # Check for new analysis requests
+                if not self.analysis_queue.empty():
+                    request = self.analysis_queue.get_nowait()
+                    await self._analyze_async(request)
+                else:
+                    await asyncio.sleep(0.1)  # Small delay to prevent busy waiting
+            except Exception as e:
+                logger.error(f"Error in async processing: {e}")
 
-        # Read and encode image
+    async def _analyze_async(self, request: Dict[str, Any]):
+        """Perform async GPT analysis."""
+        person_id = request['person_id']
+        image = request['image']
+        timestamp = request['timestamp']
+
         try:
-            with open(image_path, "rb") as image_file:
-                base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+            # Encode image
+            mime_type, base64_image = self._encode_image(image)
+
+            # Prepare prompt focused on emergency detection
+            prompt = """
+            Analyze this person in the image and determine if they need help.
+            Return ONLY a JSON object with this structure:
+            {
+                "needs_help": true or false,
+                "confidence": 0.0 to 1.0,
+                "status": ["falling", "sitting", "laying", "standing", "walking"],
+                "emergency_indicators": ["unconscious", "injured", "distressed", "normal"],
+                "posture": "upright", "bent", "prone", "supine",
+                "movement": "static" or "moving",
+                "face_visible": true or false,
+                "age_group": "child", "adult", "elderly",
+                "environment": "indoor", "outdoor", "road", "home"
+            }
+            Focus on safety and emergency detection. Be concise.
+            """
+
+            # Call OpenAI API asynchronously
+            response = await async_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url",
+                             "image_url": {"url": f"data:{mime_type};base64,{base64_image}"}}
+                        ],
+                    }
+                ],
+                max_tokens=200,
+                temperature=0.1  # Very low for consistent results
+            )
+
+            # Parse response
+            content = response.choices[0].message.content.strip()
+            if content.startswith("```json"):
+                content = content[7:-3].strip()
+
+            analysis = json.loads(content)
+
+            # Store result in cache
+            result = {
+                'person_id': person_id,
+                'timestamp': timestamp,
+                'analysis': analysis,
+                'processed_at': datetime.now().isoformat()
+            }
+
+            self.results_cache[person_id] = result
+            logger.info(f"GPT analysis completed for person {person_id}: needs_help={analysis.get('needs_help')}")
+
         except Exception as e:
-            raise ValueError(f"Error reading image file: {e}")
+            logger.error(f"GPT analysis failed for person {person_id}: {e}")
+            # Store error result
+            self.results_cache[person_id] = {
+                'person_id': person_id,
+                'timestamp': timestamp,
+                'analysis': {
+                    'needs_help': False,
+                    'confidence': 0.0,
+                    'error': str(e)
+                },
+                'processed_at': datetime.now().isoformat()
+            }
 
-    elif isinstance(image, (np.ndarray, np.generic)):  # OpenCV frame
-        if image.size == 0:
-            raise ValueError("Empty image frame provided")
+    def _encode_image(self, image: Union[np.ndarray, str, Path]) -> tuple:
+        """Encode image to base64."""
+        if isinstance(image, (str, Path)):
+            image_path = Path(image)
+            if not image_path.exists():
+                raise ValueError(f"Image file not found: {image_path}")
 
-        # Encode frame as JPEG
-        try:
-            _, buffer = cv2.imencode('.jpg', image)
+            mime_type, _ = mimetypes.guess_type(str(image_path))
+            if not mime_type or not mime_type.startswith('image/'):
+                mime_type = "image/jpeg"
+
+            with open(image_path, "rb") as f:
+                base64_image = base64.b64encode(f.read()).decode('utf-8')
+
+        elif isinstance(image, np.ndarray):
+            # OpenCV frame - encode as JPEG
+            _, buffer = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 80])
             base64_image = base64.b64encode(buffer).decode('utf-8')
             mime_type = "image/jpeg"
-        except Exception as e:
-            raise ValueError(f"Error encoding image frame: {e}")
-    else:
-        raise ValueError(
-            "Invalid input type. Provide a valid image path (str/Path) or OpenCV frame (np.ndarray)."
-        )
+        else:
+            raise ValueError("Invalid image type")
 
-    return mime_type, base64_image
+        return mime_type, base64_image
+
+    def request_analysis(self, person_id: int, image: np.ndarray, danger_value: float) -> None:
+        """
+        Request async analysis for a person if danger value exceeds threshold.
+
+        Args:
+            person_id: Unique person identifier
+            image: Person bounding box image (cropped from frame)
+            danger_value: Current danger value for the person
+        """
+        # Only analyze if danger value exceeds threshold
+        if danger_value > 1.0:
+            request = {
+                'person_id': person_id,
+                'image': image,
+                'timestamp': datetime.now().isoformat(),
+                'danger_value': danger_value
+            }
+
+            # Add to queue if not already processing this person recently
+            if person_id not in self.results_cache or \
+                    self._is_result_stale(self.results_cache[person_id]):
+                self.analysis_queue.put(request)
+                logger.info(f"Analysis requested for person {person_id} (danger={danger_value:.2f})")
+
+    def get_result(self, person_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Get cached analysis result for a person.
+
+        Returns:
+            Analysis result or None if not available
+        """
+        return self.results_cache.get(person_id)
+
+    def _is_result_stale(self, result: Dict[str, Any], max_age_seconds: int = 30) -> bool:
+        """Check if a cached result is too old."""
+        if 'processed_at' not in result:
+            return True
+
+        processed_time = datetime.fromisoformat(result['processed_at'])
+        age = (datetime.now() - processed_time).total_seconds()
+        return age > max_age_seconds
 
 
-def analyze_image(image, save_result=False, output_dir=None):
+# Global analyzer instance
+_analyzer_instance = None
+
+
+def get_analyzer() -> AsyncGPTAnalyzer:
+    """Get or create the global analyzer instance."""
+    global _analyzer_instance
+    if _analyzer_instance is None:
+        _analyzer_instance = AsyncGPTAnalyzer()
+        _analyzer_instance.start()
+    return _analyzer_instance
+
+
+def analyze_person_async(person_id: int, person_image: np.ndarray, danger_value: float) -> Dict[str, Any]:
     """
-    Analyze an image using GPT-4 Vision to extract emergency-related information.
+    Request async analysis for a person in potential danger.
 
     Args:
-        image: Either a file path (str/Path) or OpenCV frame (np.ndarray)
-        save_result: Whether to save the analysis result to file
-        output_dir: Directory to save results (defaults to outputs/temp/)
+        person_id: Unique identifier for the person
+        person_image: Cropped image of the person (from bounding box)
+        danger_value: Current calculated danger value
 
     Returns:
-        dict: Analysis results containing GPT analysis
-
-    Raises:
-        RuntimeError: If OpenAI client is not initialized or API call fails
-        ValueError: If image encoding fails
+        Immediate result if available, otherwise returns pending status
     """
-    if not client:
-        raise RuntimeError("OpenAI client not initialized. Check OPENAI_API_KEY in environment variables.")
+    analyzer = get_analyzer()
 
-    logger.info("Starting GPT image analysis...")
+    # Request analysis if danger threshold exceeded
+    analyzer.request_analysis(person_id, person_image, danger_value)
 
-    # Encode image
-    try:
-        mime_type, base64_image = encode_image_with_type(image)
-        logger.debug(f"Image encoded successfully. MIME type: {mime_type}")
-    except ValueError as e:
-        logger.error(f"Image encoding failed: {e}")
-        raise
+    # Get cached result if available
+    result = analyzer.get_result(person_id)
 
-    # Prepare analysis prompt
-    analysis_prompt = """
-    Analyze the following image and return a JSON object with the following structure:
-    {
-        "onePerson": "true" or "false",
-        "faceToTheGround": "true" or "false", 
-        "possible_age": "old_people", "adults", or "children",
-        "gender": "male" or "female",
-        "status": [
-            Multiple choice: "bleeding", "walk", "fall", "sit", "accident", "pain", "hurt", "drowning", "stampede"
-        ],
-        "environment": "road", "blaze", "water", "bed", "chair" or "indoor",
-        "lighting": "bright", "dim", or "dark",
-        "time_of_day": "day" or "night"
-    }
-
-    Ensure the result is valid JSON and avoid using descriptive or explanatory language.
-    Focus on emergency detection and safety assessment.
-    """
-
-    # Call OpenAI API
-    try:
-        logger.info("Sending request to OpenAI API...")
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": analysis_prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{base64_image}"}}
-                    ],
-                }
-            ],
-            max_tokens=300,
-            temperature=0.2  # Lower temperature for more consistent results
-        )
-        logger.info("OpenAI API response received successfully")
-
-    except Exception as e:
-        logger.error(f"OpenAI API call failed: {e}")
-        raise RuntimeError(f"Failed to analyze image with GPT: {e}")
-
-    # Extract and validate response content
-    content = response.choices[0].message.content.strip()
-    if not content:
-        raise RuntimeError("Empty response from OpenAI API")
-
-    # Clean up response (remove markdown formatting if present)
-    if content.startswith("```json") and content.endswith("```"):
-        content = content[7:-3].strip()
-
-    # Parse JSON response
-    try:
-        gpt_analysis = json.loads(content)
-        logger.info("GPT analysis completed successfully")
-        logger.debug(f"Analysis result: {json.dumps(gpt_analysis, indent=2)}")
-
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON response: {content}")
-        raise RuntimeError(f"GPT returned invalid JSON: {e}")
-
-    # Prepare result
-    result = {
-        'gpt_analysis': gpt_analysis,
-        'analysis_timestamp': None,  # Could add timestamp if needed
-        'model_used': 'gpt-4o-mini'
-    }
-
-    # Save result if requested
-    if save_result:
-        try:
-            save_analysis_result(result, output_dir)
-        except Exception as e:
-            logger.warning(f"Failed to save analysis result: {e}")
-
-    return result
-
-
-def save_analysis_result(result, output_dir=None):
-    """
-    Save analysis result to JSON file.
-
-    Args:
-        result: Analysis result dictionary
-        output_dir: Output directory (defaults to outputs/temp/)
-    """
-    if output_dir is None:
-        output_dir = settings.TEMP_DIR
-
-    # Ensure output directory exists
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    # Generate filename with timestamp
-    import datetime
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"gpt_analysis_{timestamp}.json"
-
-    # Save to file
-    output_file = output_path / filename
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-
-    logger.info(f"Analysis result saved to: {output_file}")
-
-
-def validate_analysis_result(analysis_result):
-    """
-    Validate that the analysis result contains expected fields.
-
-    Args:
-        analysis_result: Dictionary containing GPT analysis
-
-    Returns:
-        bool: True if valid, False otherwise
-    """
-    required_fields = [
-        'onePerson', 'faceToTheGround', 'possible_age', 'gender',
-        'status', 'environment', 'lighting', 'time_of_day'
-    ]
-
-    gpt_analysis = analysis_result.get('gpt_analysis', {})
-
-    for field in required_fields:
-        if field not in gpt_analysis:
-            logger.warning(f"Missing required field in analysis: {field}")
-            return False
-
-    return True
-
-
-# Example usage and testing
-if __name__ == "__main__":
-    # Test with sample image (if available)
-    test_image_path = settings.DATASETS_DIR / "test_image.jpg"  # Replace with actual test image
-
-    if test_image_path.exists():
-        try:
-            result = analyze_image(test_image_path, save_result=True)
-            print("Analysis Result:")
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-
-            # Validate result
-            if validate_analysis_result(result):
-                print("✅ Analysis result is valid")
-            else:
-                print("❌ Analysis result is missing required fields")
-
-        except Exception as e:
-            print(f"❌ Analysis failed: {e}")
+    if result:
+        return {
+            'status': 'completed',
+            'needs_help': result['analysis'].get('needs_help', False),
+            'confidence': result['analysis'].get('confidence', 0.0),
+            'details': result['analysis']
+        }
     else:
-        print(f"Test image not found at: {test_image_path}")
-        print("Please provide a test image to run the example.")
+        return {
+            'status': 'pending',
+            'needs_help': False,
+            'confidence': 0.0,
+            'details': {}
+        }
+
+
+def cleanup_analyzer():
+    """Cleanup the analyzer when shutting down."""
+    global _analyzer_instance
+    if _analyzer_instance:
+        _analyzer_instance.stop()
+        _analyzer_instance = None
